@@ -31,8 +31,10 @@ table-check diff --table-a=... --table-b=... --keys=id --dry-run
 
 ## Features
 
+- **SQLAlchemy Core** for type-safe, composable SQL generation
 - FULL OUTER JOIN comparison on specified key columns
 - NULL-safe comparison (NULLs treated as equal)
+- Automatic partition filter detection and injection
 - Delta metrics for numeric columns: `delta`, `abs_delta`, `rel_delta`
 - Supported types: INT64, FLOAT64, STRING
 
@@ -44,9 +46,19 @@ table-check diff --table-a=... --table-b=... --keys=id --dry-run
 - No schema validation (assumes identical schemas)
 - Key columns must be specified manually
 
+## Architecture
+
+Built on **SQLAlchemy Core** for programmatic SQL query construction:
+- Type-safe column expressions
+- Composable query building
+- BigQuery dialect support via `sqlalchemy-bigquery`
+- Custom NULL-safe comparison logic (BigQuery doesn't support `IS NOT DISTINCT FROM`)
+
 ## Testing
 
 ```bash
 export GOOGLE_APPLICATION_CREDENTIALS=sa.json
 pytest tests/
 ```
+
+All tests run against real BigQuery (no mocking).
