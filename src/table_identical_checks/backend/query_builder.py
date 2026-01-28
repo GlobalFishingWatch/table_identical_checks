@@ -137,6 +137,53 @@ class QueryBuilder:
                     ).label(f"{col.name}__rel_delta"),
                 ])
 
+            elif col.column_type == ColumnType.BOOLEAN:
+                # Boolean columns: cast to INT64 and treat as integer
+                # This allows us to use the same delta logic as integers
+                cast_a = literal_column(f"CAST({self.alias_a}.{col.name} AS INT64)")
+                cast_b = literal_column(f"CAST({self.alias_b}.{col.name} AS INT64)")
+                
+                select_cols.extend([
+                    col_a.label(f"a__{col.name}"),
+                    col_b.label(f"b__{col.name}"),
+                    literal_column(
+                        f"CAST({self.alias_a}.{col.name} AS INT64) - "
+                        f"CAST({self.alias_b}.{col.name} AS INT64)"
+                    ).label(f"{col.name}__delta"),
+                    literal_column(
+                        f"ABS(CAST({self.alias_a}.{col.name} AS INT64) - "
+                        f"CAST({self.alias_b}.{col.name} AS INT64))"
+                    ).label(f"{col.name}__abs_delta"),
+                    # rel_delta doesn't make sense for booleans, but include for consistency
+                    literal_column(
+                        f"SAFE_DIVIDE(CAST({self.alias_a}.{col.name} AS INT64) - "
+                        f"CAST({self.alias_b}.{col.name} AS INT64), "
+                        f"CAST({self.alias_b}.{col.name} AS INT64))"
+                    ).label(f"{col.name}__rel_delta"),
+                ])
+
+            elif col.column_type == ColumnType.TIMESTAMP:
+                # Timestamp columns: use TIMESTAMP_DIFF for delta in seconds
+                select_cols.extend([
+                    col_a.label(f"a__{col.name}"),
+                    col_b.label(f"b__{col.name}"),
+                    # TIMESTAMP_DIFF returns seconds as INT64
+                    literal_column(
+                        f"TIMESTAMP_DIFF({self.alias_a}.{col.name}, "
+                        f"{self.alias_b}.{col.name}, SECOND)"
+                    ).label(f"{col.name}__delta"),
+                    literal_column(
+                        f"ABS(TIMESTAMP_DIFF({self.alias_a}.{col.name}, "
+                        f"{self.alias_b}.{col.name}, SECOND))"
+                    ).label(f"{col.name}__abs_delta"),
+                    # rel_delta: fraction of time difference relative to b
+                    literal_column(
+                        f"SAFE_DIVIDE(TIMESTAMP_DIFF({self.alias_a}.{col.name}, "
+                        f"{self.alias_b}.{col.name}, SECOND), "
+                        f"UNIX_SECONDS({self.alias_b}.{col.name}))"
+                    ).label(f"{col.name}__rel_delta"),
+                ])
+
             elif col.column_type == ColumnType.STRING:
                 # String columns: include both values and match flag
                 select_cols.extend([

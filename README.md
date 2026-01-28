@@ -36,15 +36,18 @@ table-check diff --table-a=... --table-b=... --keys=id --dry-run
 - NULL-safe comparison (NULLs treated as equal)
 - Automatic partition filter detection and injection
 - Delta metrics for numeric columns: `delta`, `abs_delta`, `rel_delta`
-- Supported types: INT64, FLOAT64, STRING
+- Supported types: **INT64**, **FLOAT64**, **STRING**, **TIMESTAMP**, **BOOLEAN**
+  - TIMESTAMP: Uses `TIMESTAMP_DIFF()` for second-precision deltas
+  - BOOLEAN: Casts to INT64 for consistent delta calculation
 
 ## Limitations
 
 - No tolerance filtering (e.g., `abs_delta < X`)
 - No JSON/CSV export (stdout only)
-- No DATE, TIMESTAMP, BOOLEAN, ARRAY, STRUCT support
+- No ARRAY, STRUCT support
 - No schema validation (assumes identical schemas)
 - Key columns must be specified manually
+- Results are ephemeral (not persisted to BQ tables)
 
 ## Architecture
 

@@ -12,6 +12,8 @@ class ColumnType(Enum):
     INTEGER = "integer"
     FLOAT = "float"
     STRING = "string"
+    TIMESTAMP = "timestamp"
+    BOOLEAN = "boolean"
     UNSUPPORTED = "unsupported"
 
 
@@ -24,6 +26,11 @@ BQ_TYPE_MAP: dict[str, ColumnType] = {
     "NUMERIC": ColumnType.FLOAT,
     "BIGNUMERIC": ColumnType.FLOAT,
     "STRING": ColumnType.STRING,
+    "TIMESTAMP": ColumnType.TIMESTAMP,
+    "DATETIME": ColumnType.TIMESTAMP,
+    "DATE": ColumnType.TIMESTAMP,
+    "BOOLEAN": ColumnType.BOOLEAN,
+    "BOOL": ColumnType.BOOLEAN,
 }
 
 

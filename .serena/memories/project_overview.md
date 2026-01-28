@@ -32,11 +32,13 @@ The backend generates a "diff table" comparing two BQ tables by:
 - `DimensionSummary`: Breakdown by dimension value with DimensionBucket objects tracking differences and deltas per bucket
 
 ## Column Type Handling
-| Type | Comparison |
-|------|------------|
-| INT64 | Exact match |
-| FLOAT64 | Delta metrics (tolerance applied at higher layer) |
-| STRING | Exact match |
+| Type | Comparison | Delta Calculation |
+|------|------------|-------------------|
+| INT64 | Exact match | (a - b), abs, rel_delta |
+| FLOAT64 | Delta metrics | (a - b), abs, rel_delta |
+| STRING | Exact match | Match flag (boolean) |
+| **TIMESTAMP** | TIMESTAMP_DIFF | Seconds difference (INT64) |
+| **BOOLEAN** | Cast to INT64 | Treated as integer (0/1) |
 
 ## NULL Handling
 NULLs are treated as equal (using `IS NOT DISTINCT FROM` in BQ).

@@ -158,7 +158,8 @@ def generate_summary(
     value_columns = [c for c in builder.columns if c.name not in builder.key_columns]
 
     for col in value_columns:
-        if col.column_type in (ColumnType.INTEGER, ColumnType.FLOAT):
+        if col.column_type in (ColumnType.INTEGER, ColumnType.FLOAT, ColumnType.BOOLEAN, ColumnType.TIMESTAMP):
+            # Numeric-like columns: INTEGER, FLOAT, BOOLEAN (as INT64), TIMESTAMP (as seconds)
             stats_query = f"""
             WITH diff AS (
                 {diff_query}
@@ -364,9 +365,9 @@ def generate_dimension_summary(
     # Build aggregation query grouped by dimension
     delta_selects = ""
     if delta_column:
-        # Verify the column exists and is numeric
+        # Verify the column exists and is numeric-like
         col_info = next((c for c in builder.columns if c.name == delta_column), None)
-        if col_info and col_info.column_type in (ColumnType.INTEGER, ColumnType.FLOAT):
+        if col_info and col_info.column_type in (ColumnType.INTEGER, ColumnType.FLOAT, ColumnType.BOOLEAN, ColumnType.TIMESTAMP):
             delta_selects = f"""
                 MAX({delta_column}__abs_delta) AS max_abs_delta,
                 MAX(ABS({delta_column}__rel_delta)) AS max_rel_delta,
