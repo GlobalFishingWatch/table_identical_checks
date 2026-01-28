@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from google.cloud import bigquery
+from sqlalchemy import func, select
+from sqlalchemy_bigquery import BigQueryDialect
 
 from .query_builder import QueryBuilder
 from .schema import ColumnType
@@ -114,9 +116,15 @@ def generate_summary(
     Returns:
         ComparisonSummary with all statistics
     """
-    # Get total row counts for each table
-    count_a_query = f"SELECT COUNT(*) as cnt FROM `{builder.table_a}`"
-    count_b_query = f"SELECT COUNT(*) as cnt FROM `{builder.table_b}`"
+    # Get total row counts for each table using SQLAlchemy
+    # Use the same filtered table objects as in the diff query
+    table_a_obj, table_b_obj = builder.get_table_objects()
+    
+    count_a_stmt = select(func.count().label("cnt")).select_from(table_a_obj)
+    count_b_stmt = select(func.count().label("cnt")).select_from(table_b_obj)
+    
+    count_a_query = str(count_a_stmt.compile(dialect=BigQueryDialect(), compile_kwargs={"literal_binds": True}))
+    count_b_query = str(count_b_stmt.compile(dialect=BigQueryDialect(), compile_kwargs={"literal_binds": True}))
 
     total_rows_a = list(client.query(count_a_query).result())[0].cnt
     total_rows_b = list(client.query(count_b_query).result())[0].cnt

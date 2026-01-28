@@ -65,6 +65,59 @@ def get_table_schema(client: bigquery.Client, table_ref: str) -> list[ColumnInfo
     return columns
 
 
+
+def get_partition_field(client: bigquery.Client, table_ref: str) -> str | None:
+    """
+    Get the partition field for a BigQuery table from INFORMATION_SCHEMA.
+
+    Args:
+        client: BigQuery client
+        table_ref: Fully qualified table reference (project.dataset.table)
+
+    Returns:
+        Name of the partition column, or None if table is not partitioned
+    """
+    # Parse table reference
+    parts = table_ref.split(".")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid table reference: {table_ref}")
+    
+    project_id, dataset_id, table_id = parts
+
+    query = f"""
+    SELECT
+        ddl
+    FROM
+        `{project_id}.{dataset_id}.INFORMATION_SCHEMA.TABLES`
+    WHERE
+        table_name = '{table_id}'
+    """
+
+    result = client.query(query).result()
+    
+    for row in result:
+        ddl = row.ddl
+        if ddl and "PARTITION BY" in ddl:
+            # Extract partition column from DDL
+            # Format examples:
+            # PARTITION BY DATE(timestamp)
+            # PARTITION BY timestamp
+            # PARTITION BY DATE_TRUNC(timestamp, DAY)
+            # PARTITION BY TIMESTAMP_TRUNC(timestamp, MONTH)
+            import re
+            # Match function wrapping column: DATE(col), TIMESTAMP_TRUNC(col, ...)
+            match = re.search(r"PARTITION BY \w+\((\w+)", ddl)
+            if match:
+                return match.group(1)
+            
+            # Simple case: PARTITION BY column_name
+            match = re.search(r"PARTITION BY (\w+)", ddl)
+            if match:
+                return match.group(1)
+    
+    return None
+
+
 def get_column_names_by_type(
     columns: list[ColumnInfo],
     column_type: ColumnType,

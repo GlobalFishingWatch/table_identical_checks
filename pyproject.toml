@@ -28,6 +28,8 @@ classifiers = [
 ]
 dependencies = [
     "google-cloud-bigquery>=3.0.0",
+    "sqlalchemy>=2.0.0",
+    "sqlalchemy-bigquery>=1.5.0",
     "click>=8.0.0",
 ]
 

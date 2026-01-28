@@ -13,6 +13,50 @@ from .backend import (
 )
 
 
+def get_partition_filters(
+    client: bigquery.Client,
+    table_a: str,
+    table_b: str,
+    partition_filter_a: str | None,
+    partition_filter_b: str | None,
+) -> tuple[str | None, str | None]:
+    """
+    Get partition filters for both tables.
+    
+    If user provides filters, use those. Otherwise, auto-detect partition fields
+    and create dummy filters that satisfy partition elimination requirements.
+    
+    Args:
+        client: BigQuery client
+        table_a: First table reference
+        table_b: Second table reference
+        partition_filter_a: User-provided filter for table A (or None)
+        partition_filter_b: User-provided filter for table B (or None)
+        
+    Returns:
+        Tuple of (filter_a, filter_b) where each can be None if no partition
+    """
+    from table_identical_checks.backend import get_partition_field
+    
+    # Handle table A
+    final_filter_a = partition_filter_a
+    if final_filter_a is None:
+        partition_col_a = get_partition_field(client, table_a)
+        if partition_col_a:
+            final_filter_a = f"DATE({partition_col_a}) != '1979-01-01'"
+            click.echo(f"Auto-detected partition column '{partition_col_a}' for table A")
+    
+    # Handle table B
+    final_filter_b = partition_filter_b
+    if final_filter_b is None:
+        partition_col_b = get_partition_field(client, table_b)
+        if partition_col_b:
+            final_filter_b = f"DATE({partition_col_b}) != '1979-01-01'"
+            click.echo(f"Auto-detected partition column '{partition_col_b}' for table B")
+    
+    return final_filter_a, final_filter_b
+
+
 @click.group()
 @click.version_option()
 def main():
@@ -25,9 +69,20 @@ def main():
 @click.option("--table-b", required=True, help="Second table (project.dataset.table)")
 @click.option("--keys", required=True, help="Comma-separated key columns for joining")
 @click.option("--credentials", envvar="GOOGLE_APPLICATION_CREDENTIALS", help="Path to SA JSON")
+@click.option("--partition-filter-a", default=None, help="Partition filter for table A")
+@click.option("--partition-filter-b", default=None, help="Partition filter for table B")
 @click.option("--dry-run", is_flag=True, help="Print query without executing")
 @click.option("--limit", default=100, help="Max rows to return")
-def diff(table_a: str, table_b: str, keys: str, credentials: str, dry_run: bool, limit: int):
+def diff(
+    table_a: str,
+    table_b: str,
+    keys: str,
+    credentials: str,
+    partition_filter_a: str | None,
+    partition_filter_b: str | None,
+    dry_run: bool,
+    limit: int,
+):
     """Compare two tables and show differences."""
     key_columns = [k.strip() for k in keys.split(",")]
 
@@ -41,12 +96,19 @@ def diff(table_a: str, table_b: str, keys: str, credentials: str, dry_run: bool,
     click.echo(f"Fetching schema from {table_a}...")
     columns = get_table_schema(client, table_a)
 
+    # Get partition filters (auto-detect or use provided)
+    filter_a, filter_b = get_partition_filters(
+        client, table_a, table_b, partition_filter_a, partition_filter_b
+    )
+
     # Build the diff query
     builder = QueryBuilder(
         table_a=table_a,
         table_b=table_b,
         key_columns=key_columns,
         columns=columns,
+        partition_filter_a=filter_a,
+        partition_filter_b=filter_b,
     )
 
     query = builder.build_diff_query()
@@ -79,7 +141,16 @@ def diff(table_a: str, table_b: str, keys: str, credentials: str, dry_run: bool,
 @click.option("--table-b", required=True, help="Second table (project.dataset.table)")
 @click.option("--keys", required=True, help="Comma-separated key columns for joining")
 @click.option("--credentials", envvar="GOOGLE_APPLICATION_CREDENTIALS", help="Path to SA JSON")
-def count(table_a: str, table_b: str, keys: str, credentials: str):
+@click.option("--partition-filter-a", default=None, help="Partition filter for table A")
+@click.option("--partition-filter-b", default=None, help="Partition filter for table B")
+def count(
+    table_a: str,
+    table_b: str,
+    keys: str,
+    credentials: str,
+    partition_filter_a: str | None,
+    partition_filter_b: str | None,
+):
     """Count the number of differing rows between two tables."""
     key_columns = [k.strip() for k in keys.split(",")]
 
@@ -90,11 +161,18 @@ def count(table_a: str, table_b: str, keys: str, credentials: str):
 
     columns = get_table_schema(client, table_a)
 
+    # Get partition filters
+    filter_a, filter_b = get_partition_filters(
+        client, table_a, table_b, partition_filter_a, partition_filter_b
+    )
+
     builder = QueryBuilder(
         table_a=table_a,
         table_b=table_b,
         key_columns=key_columns,
         columns=columns,
+        partition_filter_a=filter_a,
+        partition_filter_b=filter_b,
     )
 
     query = builder.build_count_query()
@@ -112,7 +190,16 @@ def count(table_a: str, table_b: str, keys: str, credentials: str):
 @click.option("--table-b", required=True, help="Second table (project.dataset.table)")
 @click.option("--keys", required=True, help="Comma-separated key columns for joining")
 @click.option("--credentials", envvar="GOOGLE_APPLICATION_CREDENTIALS", help="Path to SA JSON")
-def summary(table_a: str, table_b: str, keys: str, credentials: str):
+@click.option("--partition-filter-a", default=None, help="Partition filter for table A")
+@click.option("--partition-filter-b", default=None, help="Partition filter for table B")
+def summary(
+    table_a: str,
+    table_b: str,
+    keys: str,
+    credentials: str,
+    partition_filter_a: str | None,
+    partition_filter_b: str | None,
+):
     """Generate a comprehensive comparison summary."""
     key_columns = [k.strip() for k in keys.split(",")]
 
@@ -124,11 +211,18 @@ def summary(table_a: str, table_b: str, keys: str, credentials: str):
     click.echo(f"Fetching schema from {table_a}...")
     columns = get_table_schema(client, table_a)
 
+    # Get partition filters
+    filter_a, filter_b = get_partition_filters(
+        client, table_a, table_b, partition_filter_a, partition_filter_b
+    )
+
     builder = QueryBuilder(
         table_a=table_a,
         table_b=table_b,
         key_columns=key_columns,
         columns=columns,
+        partition_filter_a=filter_a,
+        partition_filter_b=filter_b,
     )
 
     click.echo("Generating comparison summary...")
@@ -145,6 +239,8 @@ def summary(table_a: str, table_b: str, keys: str, credentials: str):
 @click.option("--delta-col", default=None, help="Numeric column to track max deltas for")
 @click.option("--limit", default=None, type=int, help="Limit number of dimension buckets")
 @click.option("--credentials", envvar="GOOGLE_APPLICATION_CREDENTIALS", help="Path to SA JSON")
+@click.option("--partition-filter-a", default=None, help="Partition filter for table A")
+@click.option("--partition-filter-b", default=None, help="Partition filter for table B")
 def breakdown(
     table_a: str,
     table_b: str,
@@ -153,6 +249,8 @@ def breakdown(
     delta_col: str | None,
     limit: int | None,
     credentials: str,
+    partition_filter_a: str | None,
+    partition_filter_b: str | None,
 ):
     """Generate comparison summary broken down by a dimension."""
     key_columns = [k.strip() for k in keys.split(",")]
@@ -165,11 +263,18 @@ def breakdown(
     click.echo(f"Fetching schema from {table_a}...")
     columns = get_table_schema(client, table_a)
 
+    # Get partition filters
+    filter_a, filter_b = get_partition_filters(
+        client, table_a, table_b, partition_filter_a, partition_filter_b
+    )
+
     builder = QueryBuilder(
         table_a=table_a,
         table_b=table_b,
         key_columns=key_columns,
         columns=columns,
+        partition_filter_a=filter_a,
+        partition_filter_b=filter_b,
     )
 
     click.echo(f"Generating breakdown by {dimension}...")
