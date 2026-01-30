@@ -1,6 +1,5 @@
 """Shared test fixtures for BigQuery testing."""
 
-import os
 import uuid
 
 import pytest
@@ -13,12 +12,7 @@ TEST_DATASET = "tech_great_expectations"
 
 @pytest.fixture(scope="session")
 def bq_client():
-    """Create a BigQuery client using the SA credentials."""
-    # Look for sa.json in project root
-    sa_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "sa.json")
-    if os.path.exists(sa_path):
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
-
+    """Create a BigQuery client using application-default credentials."""
     return bigquery.Client(project=TEST_PROJECT)
 
 

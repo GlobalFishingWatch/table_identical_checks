@@ -14,6 +14,7 @@ class ColumnType(Enum):
     STRING = "string"
     TIMESTAMP = "timestamp"
     BOOLEAN = "boolean"
+    GEOGRAPHY = "geography"
     UNSUPPORTED = "unsupported"
 
 
@@ -31,6 +32,14 @@ BQ_TYPE_MAP: dict[str, ColumnType] = {
     "DATE": ColumnType.TIMESTAMP,
     "BOOLEAN": ColumnType.BOOLEAN,
     "BOOL": ColumnType.BOOLEAN,
+    "GEOGRAPHY": ColumnType.GEOGRAPHY,
+    # Unsupported complex types
+    "ARRAY": ColumnType.UNSUPPORTED,
+    "STRUCT": ColumnType.UNSUPPORTED,
+    "RECORD": ColumnType.UNSUPPORTED,
+    "JSON": ColumnType.UNSUPPORTED,
+    "BYTES": ColumnType.UNSUPPORTED,
+    "RANGE": ColumnType.UNSUPPORTED,
 }
 
 
@@ -72,10 +81,12 @@ def get_table_schema(client: bigquery.Client, table_ref: str) -> list[ColumnInfo
     return columns
 
 
-
 def get_partition_field(client: bigquery.Client, table_ref: str) -> str | None:
     """
-    Get the partition field for a BigQuery table from INFORMATION_SCHEMA.
+    Get the partition field for a BigQuery table using the Table API.
+
+    Uses client.get_table() which only requires read access to the table,
+    unlike INFORMATION_SCHEMA which requires project-level access.
 
     Args:
         client: BigQuery client
@@ -84,44 +95,14 @@ def get_partition_field(client: bigquery.Client, table_ref: str) -> str | None:
     Returns:
         Name of the partition column, or None if table is not partitioned
     """
-    # Parse table reference
-    parts = table_ref.split(".")
-    if len(parts) != 3:
-        raise ValueError(f"Invalid table reference: {table_ref}")
-    
-    project_id, dataset_id, table_id = parts
+    table = client.get_table(table_ref)
 
-    query = f"""
-    SELECT
-        ddl
-    FROM
-        `{project_id}.{dataset_id}.INFORMATION_SCHEMA.TABLES`
-    WHERE
-        table_name = '{table_id}'
-    """
+    if table.time_partitioning is not None:
+        return table.time_partitioning.field
 
-    result = client.query(query).result()
-    
-    for row in result:
-        ddl = row.ddl
-        if ddl and "PARTITION BY" in ddl:
-            # Extract partition column from DDL
-            # Format examples:
-            # PARTITION BY DATE(timestamp)
-            # PARTITION BY timestamp
-            # PARTITION BY DATE_TRUNC(timestamp, DAY)
-            # PARTITION BY TIMESTAMP_TRUNC(timestamp, MONTH)
-            import re
-            # Match function wrapping column: DATE(col), TIMESTAMP_TRUNC(col, ...)
-            match = re.search(r"PARTITION BY \w+\((\w+)", ddl)
-            if match:
-                return match.group(1)
-            
-            # Simple case: PARTITION BY column_name
-            match = re.search(r"PARTITION BY (\w+)", ddl)
-            if match:
-                return match.group(1)
-    
+    if table.range_partitioning is not None:
+        return table.range_partitioning.field
+
     return None
 
 
