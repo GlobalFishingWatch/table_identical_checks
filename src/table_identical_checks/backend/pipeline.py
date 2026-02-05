@@ -54,6 +54,18 @@ class PipelineResult:
     total_differing_rows: int | None = None
 
 
+def differing_columns(column_diff_counts: dict[str, int]) -> list[str]:
+    """Return column names that have at least one difference.
+
+    Args:
+        column_diff_counts: Per-column diff counts from PipelineResult.column_diff_counts.
+
+    Returns:
+        List of column names where diff_count > 0.
+    """
+    return [col for col, count in column_diff_counts.items() if count > 0]
+
+
 def _parse_pipeline_result(row: bigquery.Row, builder: QueryBuilder) -> PipelineResult:
     """Parse a BigQuery result row into a PipelineResult.
 
@@ -64,8 +76,12 @@ def _parse_pipeline_result(row: bigquery.Row, builder: QueryBuilder) -> Pipeline
 
     value_cols = builder._value_columns()
 
+    def _alias(col_name: str, suffix: str) -> str:
+        """Build the mangled alias used in the pipeline SQL output columns."""
+        return f"{col_name.replace('.', '__')}__{suffix}"
+
     # Column diff counts (always present from Layer 1)
-    column_diff_counts = {col.name: row_dict[f"{col.name}__diff_count"] for col in value_cols}
+    column_diff_counts = {col.name: row_dict[_alias(col.name, "diff_count")] for col in value_cols}
 
     result = PipelineResult(
         pipeline_status=status,
@@ -105,39 +121,41 @@ def _parse_pipeline_result(row: bigquery.Row, builder: QueryBuilder) -> Pipeline
             ColumnType.BOOLEAN,
             ColumnType.TIMESTAMP,
         ):
-            max_abs = row_dict.get(f"{col.name}__max_abs_delta")
+            max_abs = row_dict.get(_alias(col.name, "max_abs_delta"))
             if max_abs is not None:
                 stats: dict = {
                     "max_abs_delta": max_abs,
-                    "max_rel_delta": row_dict.get(f"{col.name}__max_rel_delta"),
-                    "avg_abs_delta": row_dict.get(f"{col.name}__avg_abs_delta"),
-                    "sum_abs_rel_delta": row_dict.get(f"{col.name}__sum_abs_rel_delta"),
+                    "max_rel_delta": row_dict.get(_alias(col.name, "max_rel_delta")),
+                    "avg_abs_delta": row_dict.get(_alias(col.name, "avg_abs_delta")),
+                    "sum_abs_rel_delta": row_dict.get(_alias(col.name, "sum_abs_rel_delta")),
                 }
                 if col.column_type == ColumnType.FLOAT and col.name in tol_config:
-                    stats["within_tolerance_count"] = row_dict.get(f"{col.name}__within_tol_count")
+                    stats["within_tolerance_count"] = row_dict.get(
+                        _alias(col.name, "within_tol_count")
+                    )
                     stats["outside_tolerance_count"] = row_dict.get(
-                        f"{col.name}__outside_tol_count"
+                        _alias(col.name, "outside_tol_count")
                     )
                 numeric_stats[col.name] = stats
 
         elif col.column_type == ColumnType.STRING:
-            mismatches = row_dict.get(f"{col.name}__mismatches", 0)
+            mismatches = row_dict.get(_alias(col.name, "mismatches"), 0)
             if mismatches > 0:
                 string_mismatches[col.name] = mismatches
 
         elif col.column_type == ColumnType.GEOGRAPHY:
-            max_dist = row_dict.get(f"{col.name}__max_distance_m")
+            max_dist = row_dict.get(_alias(col.name, "max_distance_m"))
             if max_dist is not None:
                 geo_stats: dict = {
                     "max_distance_meters": max_dist,
-                    "avg_distance_meters": row_dict.get(f"{col.name}__avg_distance_m"),
+                    "avg_distance_meters": row_dict.get(_alias(col.name, "avg_distance_m")),
                 }
                 if col.name in tol_config:
                     geo_stats["within_tolerance_count"] = row_dict.get(
-                        f"{col.name}__within_tol_count"
+                        _alias(col.name, "within_tol_count")
                     )
                     geo_stats["outside_tolerance_count"] = row_dict.get(
-                        f"{col.name}__outside_tol_count"
+                        _alias(col.name, "outside_tol_count")
                     )
                 geography_stats[col.name] = geo_stats
 

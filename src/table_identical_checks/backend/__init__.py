@@ -1,6 +1,6 @@
 """Backend module for BigQuery operations."""
 
-from .pipeline import PipelineConfig, PipelineResult, run_pipeline
+from .pipeline import PipelineConfig, PipelineResult, differing_columns, run_pipeline
 from .query_builder import QueryBuilder
 from .schema import ColumnType, get_partition_field, get_table_schema
 from .summary import (
@@ -25,6 +25,7 @@ __all__ = [
     "ColumnType",
     "ComparisonSummary",
     "generate_summary",
+    "differing_columns",
     "run_pipeline",
     "DimensionBucket",
     "DimensionSummary",

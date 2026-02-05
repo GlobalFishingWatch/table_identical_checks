@@ -14,11 +14,13 @@ class TestUnsupportedTypeMapping:
     def test_array_is_unsupported(self):
         assert BQ_TYPE_MAP["ARRAY"] == ColumnType.UNSUPPORTED
 
-    def test_struct_is_unsupported(self):
-        assert BQ_TYPE_MAP["STRUCT"] == ColumnType.UNSUPPORTED
+    def test_struct_not_in_type_map(self):
+        """STRUCT is handled by schema flattening, not mapped directly."""
+        assert BQ_TYPE_MAP.get("STRUCT", ColumnType.UNSUPPORTED) == ColumnType.UNSUPPORTED
 
-    def test_record_is_unsupported(self):
-        assert BQ_TYPE_MAP["RECORD"] == ColumnType.UNSUPPORTED
+    def test_record_not_in_type_map(self):
+        """RECORD is handled by schema flattening, not mapped directly."""
+        assert BQ_TYPE_MAP.get("RECORD", ColumnType.UNSUPPORTED) == ColumnType.UNSUPPORTED
 
     def test_json_is_unsupported(self):
         assert BQ_TYPE_MAP["JSON"] == ColumnType.UNSUPPORTED

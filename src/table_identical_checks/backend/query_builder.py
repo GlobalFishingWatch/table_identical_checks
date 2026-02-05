@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from sqlalchemy import and_, column, func, literal_column, or_, select, table
+from sqlalchemy import and_, column, func, literal_column, or_, select, table, text
 from sqlalchemy.sql import Selectable
 from sqlalchemy_bigquery import BigQueryDialect
 
@@ -22,7 +22,8 @@ class QueryBuilder:
     - For all columns: values from both tables
 
     NULL values are treated as equal.
-    Unsupported column types (ARRAY, STRUCT, JSON, etc.) are automatically excluded.
+    Unsupported column types (ARRAY, JSON, etc.) are automatically excluded.
+    Non-repeated STRUCT fields are flattened to dot-notation sub-fields at schema level.
 
     Tolerance filtering:
     - Applied to FLOAT64 columns based on abs_delta
@@ -81,14 +82,16 @@ class QueryBuilder:
 
         # Apply partition filters if present
         if self.partition_filter_a:
-            # Create subquery with partition filter
-            filter_expr = literal_column(self.partition_filter_a)
+            # Create subquery with partition filter.
+            # Use text() not literal_column(): a WHERE predicate is a SQL
+            # fragment, not a column expression.
+            filter_expr = text(self.partition_filter_a)
             table_a_obj = select(table_a_obj).where(filter_expr).subquery(self.alias_a)
         else:
             table_a_obj = table_a_obj.alias(self.alias_a)
 
         if self.partition_filter_b:
-            filter_expr = literal_column(self.partition_filter_b)
+            filter_expr = text(self.partition_filter_b)
             table_b_obj = select(table_b_obj).where(filter_expr).subquery(self.alias_b)
         else:
             table_b_obj = table_b_obj.alias(self.alias_b)
@@ -123,8 +126,15 @@ class QueryBuilder:
             and_(col_a != col_b, col_a.isnot(None), col_b.isnot(None)),
         )
 
-    def _build_select_columns(self, table_a_obj, table_b_obj) -> list:
-        """Build all SELECT columns for the diff query."""
+    def _build_select_columns(
+        self, table_a_obj, table_b_obj, columns_filter: list[str] | None = None
+    ) -> list:
+        """Build all SELECT columns for the diff query.
+
+        Args:
+            columns_filter: If provided, only include value columns whose names
+                are in this list. Key columns and existence flags are always included.
+        """
         select_cols = []
 
         # Key columns (coalesced)
@@ -141,7 +151,12 @@ class QueryBuilder:
         )
 
         # Value columns with deltas/comparisons
-        for col in self._value_columns():
+        value_cols = self._value_columns()
+        if columns_filter is not None:
+            filter_set = set(columns_filter)
+            value_cols = [c for c in value_cols if c.name in filter_set]
+
+        for col in value_cols:
             col_a = table_a_obj.c[col.name]
             col_b = table_b_obj.c[col.name]
 
@@ -306,18 +321,37 @@ class QueryBuilder:
             f"({a} IS NOT NULL AND {b} IS NOT NULL AND ST_EQUALS({a}, {b})))"
         )
 
-    def _build_where_clause(self, table_a_obj, table_b_obj):
+    def _build_where_clause(
+        self, table_a_obj, table_b_obj, columns_filter: list[str] | None = None
+    ):
         """Build WHERE clause to filter only rows with differences.
 
         If tolerance is configured, excludes rows where:
         - ALL non-float/non-geography columns are equal, AND
         - ALL float columns (with tolerance) have abs_delta <= tolerance, AND
         - ALL geography columns (with tolerance) have ST_DISTANCE <= tolerance
+
+        Args:
+            columns_filter: If provided, only check these value columns for
+                differences in the base condition. This restricts which columns
+                appear in the OR(...) inequality checks.
+
+                Note: tolerance exclusion intentionally always considers ALL
+                value columns regardless of columns_filter. This is correct
+                because columns_filter comes from --only-diffs, which only
+                includes columns the pipeline identified as having differences.
+                Tolerance exclusion needs the full column picture to correctly
+                decide whether a row's differences are entirely within tolerance.
         """
         conditions = []
 
+        value_cols = self._value_columns()
+        if columns_filter is not None:
+            filter_set = set(columns_filter)
+            value_cols = [c for c in value_cols if c.name in filter_set]
+
         # Check for differences in value columns
-        for col in self._value_columns():
+        for col in value_cols:
             if col.column_type == ColumnType.GEOGRAPHY:
                 conditions.append(self._null_safe_geography_not_equal(col.name))
             else:
@@ -332,11 +366,10 @@ class QueryBuilder:
 
         base_condition = or_(*conditions)
 
-        # Apply tolerance filtering if configured
+        # Tolerance exclusion uses ALL value columns (not filtered) -- see docstring.
         if self.tolerance_config:
             tolerance_exclusion = self._build_tolerance_exclusion(table_a_obj, table_b_obj)
             if tolerance_exclusion is not None:
-                # Exclude rows that are only different due to float values within tolerance
                 return and_(base_condition, ~tolerance_exclusion)
 
         return base_condition
@@ -434,13 +467,19 @@ class QueryBuilder:
         # Row should be excluded if ALL conditions are met
         return and_(*exclusion_conditions)
 
-    def build_diff_query(self, apply_tolerance: bool = True) -> str:
+    def build_diff_query(
+        self,
+        apply_tolerance: bool = True,
+        columns_filter: list[str] | None = None,
+    ) -> str:
         """
         Build the complete diff query using SQLAlchemy Core.
 
         Args:
             apply_tolerance: If True, apply tolerance-based filtering.
                            If False, include all differences (useful for statistics).
+            columns_filter: If provided, only include these value columns in the
+                          SELECT and WHERE clauses. Key columns are always included.
 
         Returns:
             SQL query string that will return all differing rows with their deltas.
@@ -455,26 +494,78 @@ class QueryBuilder:
         full_join = table_a_obj.outerjoin(table_b_obj, onclause=join_condition, full=True)
 
         # Build SELECT statement
-        select_cols = self._build_select_columns(table_a_obj, table_b_obj)
+        select_cols = self._build_select_columns(table_a_obj, table_b_obj, columns_filter)
 
         # Build WHERE clause (optionally disable tolerance filtering)
         if apply_tolerance:
-            where_clause = self._build_where_clause(table_a_obj, table_b_obj)
+            where_clause = self._build_where_clause(table_a_obj, table_b_obj, columns_filter)
         else:
             # Build basic where clause without tolerance filtering
-            where_clause = self._build_where_clause_no_tolerance(table_a_obj, table_b_obj)
+            where_clause = self._build_where_clause_no_tolerance(
+                table_a_obj, table_b_obj, columns_filter
+            )
 
         stmt = select(*select_cols).select_from(full_join).where(where_clause)
 
         # Compile to SQL string for BigQuery dialect
         return str(stmt.compile(dialect=BigQueryDialect(), compile_kwargs={"literal_binds": True}))
 
-    def _build_where_clause_no_tolerance(self, table_a_obj, table_b_obj):
-        """Build WHERE clause without tolerance filtering (for statistics)."""
+    def build_diff_table_statement(
+        self,
+        destination: str,
+        write_mode: str = "replace",
+        expiration_hours: int | None = None,
+        columns_filter: list[str] | None = None,
+    ) -> str:
+        """Build a DDL statement that persists the diff query to a BQ table.
+
+        Args:
+            destination: Fully qualified BQ table name (project.dataset.table).
+            write_mode: "replace" for CREATE OR REPLACE TABLE,
+                       "if_not_exists" for CREATE TABLE IF NOT EXISTS.
+            expiration_hours: Optional TTL in hours for the destination table.
+            columns_filter: If provided, only include these value columns.
+
+        Returns:
+            DDL string (CREATE TABLE ... AS SELECT ...).
+        """
+        diff_query = self.build_diff_query(apply_tolerance=True, columns_filter=columns_filter)
+
+        if write_mode == "if_not_exists":
+            create_clause = f"CREATE TABLE IF NOT EXISTS `{destination}`"
+        else:
+            create_clause = f"CREATE OR REPLACE TABLE `{destination}`"
+
+        options_parts: list[str] = []
+        if expiration_hours is not None:
+            options_parts.append(
+                f"expiration_timestamp=TIMESTAMP_ADD("
+                f"CURRENT_TIMESTAMP(), INTERVAL {expiration_hours} HOUR)"
+            )
+
+        options_clause = ""
+        if options_parts:
+            options_clause = f"\nOPTIONS({', '.join(options_parts)})"
+
+        return f"{create_clause}{options_clause}\nAS (\n{diff_query}\n)"
+
+    def _build_where_clause_no_tolerance(
+        self, table_a_obj, table_b_obj, columns_filter: list[str] | None = None
+    ):
+        """Build WHERE clause without tolerance filtering (for statistics).
+
+        Args:
+            columns_filter: If provided, only check these value columns for differences.
+        """
         conditions = []
 
+        value_cols = self._value_columns()
+        if columns_filter is not None:
+            filter_set = set(columns_filter)
+            value_cols = [c for c in value_cols if c.name in filter_set]
+
         # Check for differences in value columns
-        for col in self._value_columns():
+        for col in value_cols:
             if col.column_type == ColumnType.GEOGRAPHY:
                 conditions.append(self._null_safe_geography_not_equal(col.name))
             else:
@@ -533,6 +624,15 @@ class QueryBuilder:
             f"(({a} IS NULL AND {b} IS NULL) "
             f"OR ({a} IS NOT NULL AND {b} IS NOT NULL AND ST_EQUALS({a}, {b})))"
         )
+
+    @staticmethod
+    def _safe_alias(name: str) -> str:
+        """Mangle a column alias to avoid dots, which are illegal in BQ temp table columns.
+
+        Replaces dots with double underscores so that ``address.street__eq``
+        becomes ``address__street__eq``.
+        """
+        return name.replace(".", "__")
 
     def _join_keys(self) -> str:
         """Build the ON clause for FULL OUTER JOIN on key columns."""
@@ -596,7 +696,8 @@ class QueryBuilder:
                 eq_expr = self._l1_geography_eq(col.name)
             else:
                 eq_expr = self._l1_null_safe_eq(col.name)
-            l1_select_parts.append(f"  {eq_expr} AS {col.name}__eq")
+            eq_alias = self._safe_alias(f"{col.name}__eq")
+            l1_select_parts.append(f"  {eq_expr} AS {eq_alias}")
 
         l1_select = ",\n".join(l1_select_parts)
 
@@ -641,8 +742,10 @@ class QueryBuilder:
             "  rows_in_both_diff AS rows_in_both_with_differences",
         ]
         for col in value_cols:
+            eq_ref = self._safe_alias(f"{col.name}__eq")
+            dc_alias = self._safe_alias(f"{col.name}__diff_count")
             abort_select_parts.append(
-                f"  COUNTIF(in_a AND in_b AND NOT {col.name}__eq) AS {col.name}__diff_count"
+                f"  COUNTIF(in_a AND in_b AND NOT {eq_ref}) AS {dc_alias}"
             )
         abort_select = ",\n".join(abort_select_parts)
         abort_stmt = f"SELECT\n{abort_select}\nFROM _l1;\n"
@@ -653,62 +756,70 @@ class QueryBuilder:
             l2_select_parts.append(f"  l1.{k}")
         # Per-column equality flags passed through for Layer 3
         for col in value_cols:
-            l2_select_parts.append(f"  l1.{col.name}__eq")
+            eq_ref = self._safe_alias(f"{col.name}__eq")
+            l2_select_parts.append(f"  l1.{eq_ref}")
 
         for col in value_cols:
             a = f"a.{col.name}"
             b = f"b.{col.name}"
 
             if col.column_type in (ColumnType.INTEGER, ColumnType.FLOAT):
+                sa = self._safe_alias
                 l2_select_parts.extend(
                     [
-                        f"  ({a} - {b}) AS {col.name}__delta",
-                        f"  ABS({a} - {b}) AS {col.name}__abs_delta",
-                        f"  SAFE_DIVIDE({a} - {b}, {b}) AS {col.name}__rel_delta",
+                        f"  ({a} - {b}) AS {sa(f'{col.name}__delta')}",
+                        f"  ABS({a} - {b}) AS {sa(f'{col.name}__abs_delta')}",
+                        f"  SAFE_DIVIDE({a} - {b}, {b}) AS {sa(f'{col.name}__rel_delta')}",
                     ]
                 )
                 # within_tol for FLOAT columns with tolerance
                 if col.column_type == ColumnType.FLOAT and col.name in tol_config:
                     tol = tol_config[col.name]
-                    l2_select_parts.append(f"  ABS({a} - {b}) <= {tol} AS {col.name}__within_tol")
+                    l2_select_parts.append(
+                        f"  ABS({a} - {b}) <= {tol} AS {sa(f'{col.name}__within_tol')}"
+                    )
 
             elif col.column_type == ColumnType.BOOLEAN:
+                sa = self._safe_alias
                 ca = f"CAST({a} AS INT64)"
                 cb = f"CAST({b} AS INT64)"
                 l2_select_parts.extend(
                     [
-                        f"  ({ca} - {cb}) AS {col.name}__delta",
-                        f"  ABS({ca} - {cb}) AS {col.name}__abs_delta",
-                        f"  SAFE_DIVIDE({ca} - {cb}, {cb}) AS {col.name}__rel_delta",
+                        f"  ({ca} - {cb}) AS {sa(f'{col.name}__delta')}",
+                        f"  ABS({ca} - {cb}) AS {sa(f'{col.name}__abs_delta')}",
+                        f"  SAFE_DIVIDE({ca} - {cb}, {cb}) AS {sa(f'{col.name}__rel_delta')}",
                     ]
                 )
 
             elif col.column_type == ColumnType.TIMESTAMP:
+                sa = self._safe_alias
                 ts = f"TIMESTAMP_DIFF({a}, {b}, MICROSECOND)"
                 l2_select_parts.extend(
                     [
-                        f"  {ts} AS {col.name}__delta",
-                        f"  ABS({ts}) AS {col.name}__abs_delta",
+                        f"  {ts} AS {sa(f'{col.name}__delta')}",
+                        f"  ABS({ts}) AS {sa(f'{col.name}__abs_delta')}",
                         f"  SAFE_DIVIDE({ts}, UNIX_MICROS({b}))"
-                        f" AS {col.name}__rel_delta",
+                        f" AS {sa(f'{col.name}__rel_delta')}",
                     ]
                 )
 
             elif col.column_type == ColumnType.STRING:
                 l2_select_parts.append(
-                    f"  NOT {self._l1_null_safe_eq(col.name)} AS {col.name}__mismatch"
+                    f"  NOT {self._l1_null_safe_eq(col.name)}"
+                    f" AS {self._safe_alias(f'{col.name}__mismatch')}"
                 )
 
             elif col.column_type == ColumnType.GEOGRAPHY:
+                sa = self._safe_alias
                 dist = f"IF({a} IS NOT NULL AND {b} IS NOT NULL, ST_DISTANCE({a}, {b}, TRUE), NULL)"
-                l2_select_parts.append(f"  {dist} AS {col.name}__distance_m")
+                l2_select_parts.append(f"  {dist} AS {sa(f'{col.name}__distance_m')}")
                 if col.name in tol_config:
                     tol = tol_config[col.name]
                     # Use spherical (no use_spheroid) for tolerance to avoid ST_DWITHIN rewrite
                     l2_select_parts.append(
                         f"  IF({a} IS NOT NULL AND {b} IS NOT NULL, "
                         f"ST_DISTANCE({a}, {b}) <= {tol}, "
-                        f"{a} IS NULL AND {b} IS NULL) AS {col.name}__within_tol"
+                        f"{a} IS NULL AND {b} IS NULL) AS {sa(f'{col.name}__within_tol')}"
                     )
 
         l2_select = ",\n".join(l2_select_parts)
@@ -737,8 +848,10 @@ class QueryBuilder:
             "  rows_in_both_diff AS rows_in_both_with_differences",
         ]
         for col in value_cols:
+            eq_ref = self._safe_alias(f"{col.name}__eq")
+            dc_alias = self._safe_alias(f"{col.name}__diff_count")
             l1_summary_parts.append(
-                f"  COUNTIF(in_a AND in_b AND NOT {col.name}__eq) AS {col.name}__diff_count"
+                f"  COUNTIF(in_a AND in_b AND NOT {eq_ref}) AS {dc_alias}"
             )
         l1_summary = ",\n".join(l1_summary_parts)
 
@@ -758,43 +871,57 @@ class QueryBuilder:
                 ColumnType.TIMESTAMP,
             )
             if col.column_type in numeric_types:
+                sa = self._safe_alias
                 l3_stats_parts.extend(
                     [
-                        f"  MAX({col.name}__abs_delta) AS {col.name}__max_abs_delta",
-                        f"  MAX(ABS({col.name}__rel_delta)) AS {col.name}__max_rel_delta",
-                        f"  AVG({col.name}__abs_delta) AS {col.name}__avg_abs_delta",
-                        f"  SUM(ABS({col.name}__rel_delta)) AS {col.name}__sum_abs_rel_delta",
+                        f"  MAX({sa(f'{col.name}__abs_delta')})"
+                        f" AS {sa(f'{col.name}__max_abs_delta')}",
+                        f"  MAX(ABS({sa(f'{col.name}__rel_delta')}))"
+                        f" AS {sa(f'{col.name}__max_rel_delta')}",
+                        f"  AVG({sa(f'{col.name}__abs_delta')})"
+                        f" AS {sa(f'{col.name}__avg_abs_delta')}",
+                        f"  SUM(ABS({sa(f'{col.name}__rel_delta')}))"
+                        f" AS {sa(f'{col.name}__sum_abs_rel_delta')}",
                     ]
                 )
                 if col.column_type == ColumnType.FLOAT and col.name in tol_config:
+                    wt = sa(f"{col.name}__within_tol")
                     l3_stats_parts.extend(
                         [
-                            f"  COUNTIF({col.name}__within_tol) AS {col.name}__within_tol_count",
-                            f"  COUNTIF(NOT {col.name}__within_tol)"
-                            f" AS {col.name}__outside_tol_count",
+                            f"  COUNTIF({wt}) AS {sa(f'{col.name}__within_tol_count')}",
+                            f"  COUNTIF(NOT {wt})"
+                            f" AS {sa(f'{col.name}__outside_tol_count')}",
                         ]
                     )
-                    tol_col_within_flags.append(f"{col.name}__within_tol")
+                    tol_col_within_flags.append(wt)
 
             elif col.column_type == ColumnType.STRING:
-                l3_stats_parts.append(f"  COUNTIF({col.name}__mismatch) AS {col.name}__mismatches")
+                sa = self._safe_alias
+                l3_stats_parts.append(
+                    f"  COUNTIF({sa(f'{col.name}__mismatch')})"
+                    f" AS {sa(f'{col.name}__mismatches')}"
+                )
 
             elif col.column_type == ColumnType.GEOGRAPHY:
+                sa = self._safe_alias
                 l3_stats_parts.extend(
                     [
-                        f"  MAX({col.name}__distance_m) AS {col.name}__max_distance_m",
-                        f"  AVG({col.name}__distance_m) AS {col.name}__avg_distance_m",
+                        f"  MAX({sa(f'{col.name}__distance_m')})"
+                        f" AS {sa(f'{col.name}__max_distance_m')}",
+                        f"  AVG({sa(f'{col.name}__distance_m')})"
+                        f" AS {sa(f'{col.name}__avg_distance_m')}",
                     ]
                 )
                 if col.name in tol_config:
+                    wt = sa(f"{col.name}__within_tol")
                     l3_stats_parts.extend(
                         [
-                            f"  COUNTIF({col.name}__within_tol) AS {col.name}__within_tol_count",
-                            f"  COUNTIF(NOT {col.name}__within_tol)"
-                            f" AS {col.name}__outside_tol_count",
+                            f"  COUNTIF({wt}) AS {sa(f'{col.name}__within_tol_count')}",
+                            f"  COUNTIF(NOT {wt})"
+                            f" AS {sa(f'{col.name}__outside_tol_count')}",
                         ]
                     )
-                    tol_col_within_flags.append(f"{col.name}__within_tol")
+                    tol_col_within_flags.append(wt)
 
         # Post-tolerance diff count: rows where NOT all toleranced columns are within tol
         if tol_col_within_flags:

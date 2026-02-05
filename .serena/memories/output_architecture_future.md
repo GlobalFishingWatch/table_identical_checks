@@ -48,3 +48,20 @@ The user has clarified the intended output architecture for table comparisons. T
 - Different users can analyze the same comparison
 - TTLs ensure cleanup of temporary comparison data
 - Enables iterative analysis without re-running expensive comparisons
+
+## Implemented (2025-01)
+
+The `--output-table` option on `diff` command now implements **Stage 2** (Delta Table):
+- `--output-table=project.dataset.table` persists diff to BQ
+- `--write-mode=replace` (default) or `if_not_exists`
+- `--expiration-hours=N` sets TTL
+- `--only-diffs` + `--output-table` persists a focused diff with only differing columns
+
+**Stage 1 (SetDiff)** is not separately implemented; the current approach combines setdiff + deltas.
+
+## Planned Improvements
+
+### Diff Output UX Enhancements
+1. **ORDER BY in_a AND in_b DESC**: Prioritize showing actual value differences before existence-only rows
+2. **Summary column**: Add a column indicating which columns differ per row, or a label like "only_in_a", "only_in_b", "value_diff(col1,col2)"
+3. This will make the `--only-diffs` output more informative when both value diffs and existence diffs are present

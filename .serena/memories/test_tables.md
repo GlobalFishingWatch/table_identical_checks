@@ -21,6 +21,25 @@ When comparing without tolerance:
 - 24/26 columns successfully compared (before TIMESTAMP and BOOLEAN support was added)
 - Now all 26/26 columns can be compared
 
+## Table C (vessel_info baseline)
+`world-fishing-827.pipe_ais_test_202408250000_published.vessel_info`
+
+## Table D (vessel_info comparison)
+`world-fishing-827.pipe_ais_test_202408290000_published.vessel_info`
+
+### Characteristics
+- Key column: `vessel_id`
+- Published pipeline output tables
+
+## Table E (messages baseline)
+`world-fishing-827.pipe_ais_test_202408250000_published.messages`
+
+## Table F (messages comparison)
+`world-fishing-827.pipe_ais_test_202408290000_published.messages`
+
+### Characteristics
+- Published pipeline output tables
+
 ## Typical Usage
 ```bash
 table-check summary \

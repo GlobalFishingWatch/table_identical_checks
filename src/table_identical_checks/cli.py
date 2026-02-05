@@ -1,10 +1,13 @@
 """Command-line interface for table identical checks."""
 
 import os
+from datetime import datetime, timezone
+from typing import Sequence
 
 import click
 import google.auth
 from google.cloud import bigquery
+from tabulate import tabulate
 
 from .backend import (
     PipelineConfig,
@@ -139,6 +142,82 @@ def _warn_excluded_columns(builder: QueryBuilder) -> None:
     click.echo("")
 
 
+def _rows_to_dicts(rows: Sequence[bigquery.Row]) -> list[dict[str, object]]:
+    """Convert BigQuery Row objects to plain dicts, preserving full float precision."""
+    return [dict(row) for row in rows]
+
+
+def _format_rows_table(rows: Sequence[dict[str, object]]) -> str:
+    """Format a sequence of row dicts as an aligned table string using tabulate.
+
+    Float values are rendered with repr() to preserve full precision.
+    """
+    if not rows:
+        return ""
+
+    headers = list(rows[0].keys())
+
+    def _format_value(val: object) -> str:
+        if isinstance(val, float):
+            return repr(val)
+        return str(val)
+
+    table_rows = [
+        [_format_value(row.get(h)) for h in headers]
+        for row in rows
+    ]
+
+    return tabulate(table_rows, headers=headers, tablefmt="simple", disable_numparse=True)
+
+
+def _write_diff_tempfile(formatted_table: str, row_count: int) -> str:
+    """Write the full formatted diff table to a temp file.
+
+    Returns the file path.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    path = f"/tmp/table-check-diff-{timestamp}.txt"
+    with open(path, "w") as f:
+        f.write(f"Full diff output ({row_count} rows)\n")
+        f.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n")
+        f.write(formatted_table)
+        f.write("\n")
+    return path
+
+
+def _display_diff_results(
+    rows: Sequence[bigquery.Row],
+    max_display_rows: int,
+) -> None:
+    """Display diff results as a formatted table.
+
+    - Prints up to max_display_rows to stdout.
+    - Writes ALL rows to a temp file for full inspection.
+    - Prints the temp file path.
+    """
+    all_dicts = _rows_to_dicts(rows)
+    total = len(all_dicts)
+
+    # Format ALL rows for the temp file
+    full_table = _format_rows_table(all_dicts)
+    temp_path = _write_diff_tempfile(full_table, total)
+
+    # Format and display limited rows to stdout
+    display_dicts = all_dicts[:max_display_rows]
+    display_table = _format_rows_table(display_dicts)
+
+    click.echo(display_table)
+
+    if total > max_display_rows:
+        click.echo(
+            f"\n... {total - max_display_rows} more row(s) not shown "
+            f"(showing {max_display_rows} of {total})"
+        )
+
+    click.echo(f"\nFull result written to: {temp_path}")
+    click.echo("Inspect with: less -S " + temp_path)
+
+
 @click.group()
 @click.version_option()
 def main():
@@ -160,6 +239,25 @@ def main():
 )
 @click.option("--dry-run", is_flag=True, help="Print query without executing")
 @click.option("--limit", default=100, help="Max rows to return")
+@click.option("--output-table", default=None, help="Write diff to this BQ table")
+@click.option(
+    "--write-mode",
+    default="replace",
+    type=click.Choice(["replace", "if_not_exists"]),
+    help="DDL mode for --output-table",
+)
+@click.option("--expiration-hours", default=None, type=int, help="TTL for output table (hours)")
+@click.option(
+    "--only-diffs",
+    is_flag=True,
+    help="Show only key columns and columns with actual differences",
+)
+@click.option(
+    "--max-display-rows",
+    default=20,
+    type=int,
+    help="Max rows to display in stdout (default 20). Full result goes to a temp file.",
+)
 def diff(
     table_a: str,
     table_b: str,
@@ -170,8 +268,15 @@ def diff(
     tolerance: str | None,
     dry_run: bool,
     limit: int,
+    output_table: str | None,
+    write_mode: str,
+    expiration_hours: int | None,
+    only_diffs: bool,
+    max_display_rows: int,
 ):
     """Compare two tables and show differences."""
+    from .backend.pipeline import differing_columns, run_pipeline
+
     key_columns = [k.strip() for k in keys.split(",")]
 
     # Set credentials if provided
@@ -192,7 +297,7 @@ def diff(
     # Parse tolerance config
     tolerance_config = ToleranceConfig.parse(tolerance) if tolerance else None
 
-    # Build the diff query
+    # Build the query builder
     builder = QueryBuilder(
         table_a=table_a,
         table_b=table_b,
@@ -204,29 +309,59 @@ def diff(
     )
     _warn_excluded_columns(builder)
 
-    query = builder.build_diff_query()
+    # Determine column filter if --only-diffs is set
+    columns_filter: list[str] | None = None
+    if only_diffs:
+        click.echo("Running pipeline to identify differing columns...")
+        pipeline_result = run_pipeline(client, builder, PipelineConfig())
+        columns_filter = differing_columns(pipeline_result.column_diff_counts)
+        if not columns_filter:
+            click.echo("Tables are identical (no differences found).")
+            return
+        click.echo(f"Columns with differences: {', '.join(columns_filter)}")
 
-    if dry_run:
-        click.echo("\n--- Generated Query ---")
-        click.echo(query)
-        return
+    # Branch: persist to table vs. print rows
+    if output_table:
+        ddl = builder.build_diff_table_statement(
+            destination=output_table,
+            write_mode=write_mode,
+            expiration_hours=expiration_hours,
+            columns_filter=columns_filter,
+        )
 
-    # Execute with limit
-    query_with_limit = f"{query}\nLIMIT {limit}"
-    click.echo("Executing diff query...")
+        if dry_run:
+            click.echo("\n--- Generated DDL ---")
+            click.echo(ddl)
+            return
 
-    result = client.query(query_with_limit).result()
-    rows = list(result)
+        click.echo(f"Writing diff to {output_table}...")
+        client.query(ddl).result()
 
-    if not rows:
-        click.echo("Tables are identical (no differences found).")
-        return
+        # Report row count
+        count_result = client.query(f"SELECT COUNT(*) AS cnt FROM `{output_table}`").result()
+        row_count = list(count_result)[0].cnt
+        click.echo(f"Done. {row_count} row(s) written to {output_table}")
+    else:
+        query = builder.build_diff_query(columns_filter=columns_filter)
 
-    click.echo(f"\nFound {len(rows)} differing row(s):\n")
+        if dry_run:
+            click.echo("\n--- Generated Query ---")
+            click.echo(query)
+            return
 
-    # Print results
-    for row in rows:
-        click.echo(dict(row))
+        # Execute with limit
+        query_with_limit = f"{query}\nLIMIT {limit}"
+        click.echo("Executing diff query...")
+
+        result = client.query(query_with_limit).result()
+        rows = list(result)
+
+        if not rows:
+            click.echo("Tables are identical (no differences found).")
+            return
+
+        click.echo(f"\nFound {len(rows)} differing row(s):\n")
+        _display_diff_results(rows, max_display_rows)
 
 
 @main.command()

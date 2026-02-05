@@ -25,6 +25,12 @@ The backend generates a "diff table" comparing two BQ tables by:
 ## CLI Commands
 All commands support `--tolerance` for float comparison filtering:
 - `table-check diff` - Show differing rows (with --dry-run option)
+  - `--output-table`: Persist diff to a BQ table (CREATE OR REPLACE TABLE ... AS SELECT ...)
+  - `--write-mode`: "replace" (default) or "if_not_exists"
+  - `--expiration-hours`: Optional TTL for the output table
+  - `--only-diffs`: Run pipeline first, then show only columns with actual differences
+  - `--max-display-rows`: Limit stdout output (default 20); full result always written to temp file
+  - These options compose: `--only-diffs --output-table` persists a focused diff
 - `table-check count` - Count differences
 - `table-check summary` - Comprehensive comparison summary with delta stats per column
 - `table-check breakdown` - Summary broken down by a dimension (e.g., date) with optional delta column tracking
@@ -57,10 +63,22 @@ All commands support `--tolerance` for float comparison filtering:
 | TIMESTAMP | TIMESTAMP_DIFF | Seconds difference (INT64) | No |
 | BOOLEAN | Cast to INT64 | Treated as integer (0/1) | No |
 | GEOGRAPHY | ST_EQUALS | ST_DISTANCE (meters, WGS84) | **Yes** (meters) |
+| STRUCT/RECORD | Flattened | Sub-fields compared individually | Per sub-field |
 | UNSUPPORTED | Auto-excluded | N/A | N/A |
 
+## STRUCT Support
+- Non-repeated STRUCT/RECORD fields are **flattened** at schema level into dot-notation sub-fields
+- `_flatten_fields()` in `schema.py` recursively expands struct fields (e.g., `address.street`, `address.zip_code`)
+- Nested structs produce multi-level names (e.g., `outer.inner.x`)
+- Sub-fields are compared as regular columns (STRING, INT64, FLOAT64, etc.)
+- Tolerance works on FLOAT64 sub-fields: `--tolerance=address.lat:1e-9`
+- Pipeline SQL uses `_safe_alias()` to mangle dot-notation into underscored alias names (dots are illegal in BQ temp table column names)
+- `_parse_pipeline_result()` in `pipeline.py` uses matching `_alias()` helper for result column lookup
+- REPEATED STRUCTs remain UNSUPPORTED (auto-excluded)
+- REPEATED sub-fields inside a non-repeated STRUCT are marked UNSUPPORTED individually
+
 ## Unsupported Column Auto-Exclusion
-Tables with unsupported types (ARRAY, STRUCT, RECORD, JSON, BYTES, RANGE) are handled gracefully:
+Tables with unsupported types (ARRAY, JSON, BYTES, RANGE, REPEATED STRUCT) are handled gracefully:
 - Unsupported columns are automatically excluded from query generation
 - Excluded columns are tracked via `QueryBuilder.excluded_columns`
 - CLI prints a prominent yellow warning when unsupported columns are detected
@@ -84,6 +102,12 @@ Tables with unsupported types (ARRAY, STRUCT, RECORD, JSON, BYTES, RANGE) are ha
 - **Pre/Post Tolerance Counts**: Summary shows both "all differences" and "significant differences"
 - **Significance Sorting**: `--sort-columns=significance` orders columns by SUM(ABS(rel_delta))
 
+## Partition Filter Auto-Detection
+- Uses a **dry-run query** (`SELECT * FROM table` with `dry_run=True`) to detect partition requirements
+- Works for both base tables and **views over partitioned tables** (BQ resolves the full query plan)
+- Falls back to Table API metadata (`time_partitioning.field`) for non-required partitions
+- The dry-run is free (no bytes processed, ~0.5s latency)
+
 ## NULL Handling
 NULLs are treated as equal (NULL-safe comparison).
 
@@ -93,6 +117,7 @@ NULLs are treated as equal (NULL-safe comparison).
 - **sqlalchemy>=2.0.0** - SQL query construction
 - **sqlalchemy-bigquery>=1.5.0** - BigQuery dialect
 - click>=8.0.0 (CLI)
+- tabulate>=0.9.0 (table formatting for diff output)
 - pytest>=7.0.0 (testing)
 - pytest-cov>=4.0.0 (coverage)
 - ruff>=0.1.0 (linting/formatting)
@@ -111,7 +136,7 @@ Key files:
 - Pipeline is default; `--legacy` flag falls back to multi-query path
 
 ## Testing & Coverage
-- 141 tests total (18 numeric + 11 string + 19 tolerance + 54 table-formatter + 13 geography + 19 unsupported + 18 pipeline)
+- 200 tests total (9 numeric + 9 string + 19 tolerance + 54 table-formatter + 13 geography + 19 unsupported + 18 pipeline + 25 struct + 34 diff-output)
 - Tests run against real BigQuery (no mocking)
 - Current coverage: 74% overall
   - backend/pipeline.py: 94%
