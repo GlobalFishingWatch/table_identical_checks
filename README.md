@@ -81,6 +81,36 @@ shipname.freq             FLT               2     0.32%     1.0e-04     2.1e-04 
 
 Out of 29 value columns (including flattened STRUCT sub-fields), only 2 rows differ in 2 columns.
 
+Adding `--tolerance=0.001` filters out those small float differences -- both columns
+flip to `OK` and the overall result becomes `IDENTICAL`:
+
+```
+$ table-check summary \
+    --table-a=pipe_ais_test_202408250000_published.vessel_info \
+    --table-b=pipe_ais_test_202408290000_published.vessel_info \
+    --keys=vessel_id --format=table --tolerance=0.001
+
+================================================================================
+=============================== table comparison ===============================
+...vessel_info vs ...vessel_info
+keys: vessel_id | tol: 0.001
+
+rows: 623 vs 623 | diffs: 2 (filtered 2)
+
+Identical columns: callsign.count, callsign.freq, callsign.value, ...
+
+--------------------------------------------------------------------------------
+Column                   Type           Diffs     Diff%      MaxAbs      MaxRel      AvgAbs      Exc.tol   Within tol  Status
+-----------------------------------------------------------------------------------------------------------------------------
+n_shipname.freq           FLT               2     0.32%     1.0e-04     2.1e-04     7.1e-05            0            2      OK
+shipname.freq             FLT               2     0.32%     1.0e-04     2.1e-04     7.1e-05            0            2      OK
+================================================================================
+===================================IDENTICAL====================================
+```
+
+The `Exc.tol` (exceeding tolerance) and `Within tol` columns appear when tolerance is active.
+All 2 diffs fall within `0.001`, so `Exc.tol = 0` and `Status = OK` for both.
+
 ## Features
 
 - **Multi-layer pipeline**: The `summary` command runs as a single BQ multi-statement script with automatic circuit breaker
