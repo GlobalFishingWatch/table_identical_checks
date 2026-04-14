@@ -1,5 +1,13 @@
 # Table Identical Checks
 
+> :warning: **Disclaimer:** This project is entirely maintained by Claude Code with high-level human supervision. Manual guidance is provided up to the following level:
+> 1. Choice of infrastructure and architecture,
+> 2. Flow of the data and checkpoints,
+> 3. Definition of comparability and tolerances,
+> 4. Input and output interfaces.
+
+---
+
 Compare BigQuery tables and identify differences.
 
 ## Installation
