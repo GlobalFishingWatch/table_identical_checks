@@ -46,6 +46,41 @@ table-check diff ... --dry-run
 
 See [docs/cli-reference.md](docs/cli-reference.md) for full option details.
 
+## Example Output
+
+Comparing two versions of a vessel info table (623 rows, 29 value columns):
+
+```
+$ table-check summary \
+    --table-a=pipe_ais_test_202408250000_published.vessel_info \
+    --table-b=pipe_ais_test_202408290000_published.vessel_info \
+    --keys=vessel_id --format=table
+
+================================================================================
+=============================== table comparison ===============================
+pipe_ais_test_202408250000_published.vessel_info vs pipe_ais_test_202408290000_published.vessel_info
+keys: vessel_id
+
+rows: 623 vs 623 | diffs: 2
+
+Identical columns: callsign.count, callsign.freq, callsign.value, first_timestamp,
+  imo.count, imo.freq, imo.value, last_timestamp, length.count, length.freq,
+  length.value, msg_count, n_callsign.count, n_callsign.freq, n_callsign.value,
+  n_imo.count, n_imo.freq, n_imo.value, n_shipname.count, n_shipname.value,
+  pos_count, shipname.count, shipname.value, ssvid, width.count, width.freq,
+  width.value
+
+--------------------------------------------------------------------------------
+Column                   Type           Diffs     Diff%      MaxAbs      MaxRel      AvgAbs  Status
+---------------------------------------------------------------------------------------------------
+n_shipname.freq           FLT               2     0.32%     1.0e-04     2.1e-04     7.1e-05     NOK
+shipname.freq             FLT               2     0.32%     1.0e-04     2.1e-04     7.1e-05     NOK
+================================================================================
+============================== DIFFERENCES FOUND ===============================
+```
+
+Out of 29 value columns (including flattened STRUCT sub-fields), only 2 rows differ in 2 columns.
+
 ## Features
 
 - **Multi-layer pipeline**: The `summary` command runs as a single BQ multi-statement script with automatic circuit breaker
