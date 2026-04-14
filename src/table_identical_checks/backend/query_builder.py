@@ -587,6 +587,40 @@ class QueryBuilder:
         count_stmt = f"SELECT COUNT(*) AS diff_count FROM ({diff_query})"
         return count_stmt
 
+    def build_duplicate_check_query(self) -> str:
+        """Build a query that checks for duplicate keys in both tables.
+
+        Returns a single query that produces one row with:
+          - dupes_a: number of duplicate key groups in table A
+          - dupe_rows_a: total rows involved in duplicates in table A
+          - max_dupe_count_a: highest count for a single key in table A
+          - dupes_b / dupe_rows_b / max_dupe_count_b: same for table B
+        """
+        keys_csv = ", ".join(self.key_columns)
+        src_a = self._table_source(self.table_a, "a", self.partition_filter_a)
+        src_b = self._table_source(self.table_b, "b", self.partition_filter_b)
+
+        return (
+            f"WITH dupes_a AS (\n"
+            f"  SELECT {keys_csv}, COUNT(*) AS n\n"
+            f"  FROM {src_a}\n"
+            f"  GROUP BY {keys_csv}\n"
+            f"  HAVING n > 1\n"
+            f"), dupes_b AS (\n"
+            f"  SELECT {keys_csv}, COUNT(*) AS n\n"
+            f"  FROM {src_b}\n"
+            f"  GROUP BY {keys_csv}\n"
+            f"  HAVING n > 1\n"
+            f")\n"
+            f"SELECT\n"
+            f"  (SELECT COUNT(*) FROM dupes_a) AS dupes_a,\n"
+            f"  (SELECT IFNULL(SUM(n), 0) FROM dupes_a) AS dupe_rows_a,\n"
+            f"  (SELECT IFNULL(MAX(n), 0) FROM dupes_a) AS max_dupe_count_a,\n"
+            f"  (SELECT COUNT(*) FROM dupes_b) AS dupes_b,\n"
+            f"  (SELECT IFNULL(SUM(n), 0) FROM dupes_b) AS dupe_rows_b,\n"
+            f"  (SELECT IFNULL(MAX(n), 0) FROM dupes_b) AS max_dupe_count_b"
+        )
+
     def get_table_objects(self) -> tuple[Selectable, Selectable]:
         """
         Get the SQLAlchemy table objects for use in other queries.

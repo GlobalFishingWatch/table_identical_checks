@@ -12,6 +12,24 @@ from .query_builder import QueryBuilder
 from .schema import ColumnType
 
 # ---------------------------------------------------------------------------
+# Duplicate key info
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DuplicateInfo:
+    """Result of a duplicate-key check for one table."""
+
+    duplicate_key_count: int  # number of distinct keys that appear more than once
+    duplicate_row_count: int  # total rows involved in those duplicates
+    max_duplicate_count: int  # highest repeat count for a single key
+
+    @property
+    def has_duplicates(self) -> bool:
+        return self.duplicate_key_count > 0
+
+
+# ---------------------------------------------------------------------------
 # Formatter protocol
 # ---------------------------------------------------------------------------
 
@@ -70,6 +88,45 @@ def _truncate(name: str, max_len: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared duplicate-key warning block
+# ---------------------------------------------------------------------------
+
+
+def _format_duplicate_warning(summary: "ComparisonSummary") -> list[str]:
+    """Return lines for a prominent duplicate-key warning, or empty list if clean."""
+    lines: list[str] = []
+    dup_a = summary.duplicate_info_a
+    dup_b = summary.duplicate_info_b
+
+    if dup_a is None and dup_b is None:
+        return lines
+
+    has_any = (dup_a and dup_a.has_duplicates) or (dup_b and dup_b.has_duplicates)
+    if not has_any:
+        return lines
+
+    banner = "!" * 60
+    lines.append("")
+    lines.append(banner)
+    lines.append("!! DUPLICATE KEYS DETECTED !!")
+    lines.append(banner)
+    lines.append("  Comparison results may be unreliable when keys are not unique.")
+    lines.append("")
+
+    for label, info in [("Table A", dup_a), ("Table B", dup_b)]:
+        if info and info.has_duplicates:
+            lines.append(
+                f"  {label}: {info.duplicate_key_count:,} duplicate key(s), "
+                f"{info.duplicate_row_count:,} rows affected, "
+                f"max {info.max_duplicate_count}x per key"
+            )
+
+    lines.append(banner)
+    lines.append("")
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Verbose formatter (the original __str__ output)
 # ---------------------------------------------------------------------------
 
@@ -86,6 +143,9 @@ class VerboseFormatter:
             f"Table B: {summary.table_b}",
             f"Key columns: {', '.join(summary.key_columns)}",
         ]
+
+        # Show duplicate key warning prominently
+        lines.extend(_format_duplicate_warning(summary))
 
         # Show excluded columns prominently near the top
         if summary.excluded_columns:
@@ -269,6 +329,8 @@ class _ColumnRow:
 
     name: str
     col_type: ColumnType
+    diff_count: int | None = None  # per-column diff count (from pipeline Layer 1)
+    total_rows: int | None = None  # total comparable rows (for computing diff%)
     max_abs: float | None = None
     max_rel: float | None = None
     avg_abs: float | None = None
@@ -328,6 +390,9 @@ class TableFormatter:
             lines.append(keys_str)
 
         lines.append("")
+
+        # -- duplicate key warning (very prominent) --------------------------
+        lines.extend(_format_duplicate_warning(summary))
 
         # -- excluded columns (prominent) ------------------------------------
         if summary.excluded_columns:
@@ -395,6 +460,9 @@ class TableFormatter:
         """Build the list of _ColumnRow objects for non-identical columns."""
         rows: list[_ColumnRow] = []
         has_tol = summary.has_tolerance
+        cdc = summary.column_diff_counts
+        # total_rows for diff%: use min of both tables (rows that can be matched)
+        total_rows = min(summary.total_rows_a, summary.total_rows_b) if cdc else None
 
         # Numeric columns
         for col_name, stats in summary.numeric_column_stats.items():
@@ -406,6 +474,8 @@ class TableFormatter:
                 _ColumnRow(
                     name=col_name,
                     col_type=col_type,
+                    diff_count=cdc.get(col_name),
+                    total_rows=total_rows,
                     max_abs=stats.get("max_abs_delta"),
                     max_rel=stats.get("max_rel_delta"),
                     avg_abs=stats.get("avg_abs_delta"),
@@ -421,6 +491,8 @@ class TableFormatter:
                 _ColumnRow(
                     name=col_name,
                     col_type=ColumnType.STRING,
+                    diff_count=cdc.get(col_name),
+                    total_rows=total_rows,
                     mismatch_count=mismatch_count,
                 )
             )
@@ -434,6 +506,8 @@ class TableFormatter:
                 _ColumnRow(
                     name=col_name,
                     col_type=ColumnType.GEOGRAPHY,
+                    diff_count=cdc.get(col_name),
+                    total_rows=total_rows,
                     max_abs=stats.get("max_distance_meters"),
                     avg_abs=stats.get("avg_distance_meters"),
                     outside_tolerance=stats.get("outside_tolerance_count"),
@@ -455,6 +529,18 @@ class TableFormatter:
 
         return rows
 
+    @staticmethod
+    def _fmt_diff_pct(row: _ColumnRow) -> str:
+        """Format the diff percentage for a column row."""
+        if row.diff_count is None or row.total_rows is None or row.total_rows == 0:
+            return "-"
+        pct = row.diff_count / row.total_rows * 100
+        if pct >= 10:
+            return f"{pct:.1f}%"
+        if pct >= 0.01:
+            return f"{pct:.2f}%"
+        return f"{pct:.1e}%"
+
     def _render_table(
         self, col_rows: list[_ColumnRow], *, show_tol: bool
     ) -> tuple[str, str, list[str]]:
@@ -466,16 +552,25 @@ class TableFormatter:
         type_w = 5
         num_w = 10
         count_w = 11
+        diff_count_w = 14
+        diff_pct_w = 8
         status_w = 6
+
+        show_diffs = any(row.diff_count is not None for row in col_rows)
 
         # Build header parts
         parts_h = [
             f"{'Column':<{name_w}}",
             f"{'Type':>{type_w}}",
+        ]
+        if show_diffs:
+            parts_h.append(f"{'Diffs':>{diff_count_w}}")
+            parts_h.append(f"{'Diff%':>{diff_pct_w}}")
+        parts_h.extend([
             f"{'MaxAbs':>{num_w}}",
             f"{'MaxRel':>{num_w}}",
             f"{'AvgAbs':>{num_w}}",
-        ]
+        ])
         if show_tol:
             parts_h.append(f"{'Exc.tol':>{count_w}}")
             parts_h.append(f"{'Within tol':>{count_w}}")
@@ -493,6 +588,9 @@ class TableFormatter:
                     f"{_truncate(row.name, name_w):<{name_w}}",
                     f"{_TYPE_ABBREV.get(row.col_type, '?'):>{type_w}}",
                 ]
+                if show_diffs:
+                    parts_d.append(f"{_fmt_count(row.diff_count):>{diff_count_w}}")
+                    parts_d.append(f"{self._fmt_diff_pct(row):>{diff_pct_w}}")
                 # Merge the three numeric columns into a single mismatch info
                 mismatch_text = f"{_fmt_count(row.mismatch_count)} mismatches"
                 merged_w = num_w * 3 + 4  # three columns plus two "  " gaps
@@ -506,10 +604,15 @@ class TableFormatter:
                 parts_d = [
                     f"{_truncate(row.name, name_w):<{name_w}}",
                     f"{_TYPE_ABBREV.get(row.col_type, '?'):>{type_w}}",
+                ]
+                if show_diffs:
+                    parts_d.append(f"{_fmt_count(row.diff_count):>{diff_count_w}}")
+                    parts_d.append(f"{self._fmt_diff_pct(row):>{diff_pct_w}}")
+                parts_d.extend([
                     f"{_fmt_number(row.max_abs):>{num_w}}",
                     f"{_fmt_number(row.max_rel):>{num_w}}",
                     f"{_fmt_number(row.avg_abs):>{num_w}}",
-                ]
+                ])
                 if show_tol:
                     parts_d.append(f"{_fmt_count(row.outside_tolerance):>{count_w}}")
                     parts_d.append(f"{_fmt_count(row.within_tolerance):>{count_w}}")
@@ -577,6 +680,9 @@ class ComparisonSummary:
         default_factory=list
     )  # [(col_name, bq_type), ...]
 
+    # Per-column diff counts (from pipeline Layer 1; empty for legacy path)
+    column_diff_counts: dict[str, int] = field(default_factory=dict)  # col -> count
+
     # Per-column type mapping for all *value* (non-key) columns
     column_types: dict[str, ColumnType] = field(default_factory=dict)  # col -> ColumnType
 
@@ -588,6 +694,10 @@ class ComparisonSummary:
     rows_only_in_b_pretolerance: int | None = None
     rows_in_both_with_differences_pretolerance: int | None = None
     rows_identical_pretolerance: int | None = None
+
+    # Duplicate key info (optional -- None means check was not run)
+    duplicate_info_a: DuplicateInfo | None = None
+    duplicate_info_b: DuplicateInfo | None = None
 
     # Column sorting order
     column_sort_order: str = "alphabetical"  # "alphabetical" or "significance"
@@ -627,6 +737,32 @@ class ComparisonSummary:
 # ---------------------------------------------------------------------------
 
 
+def check_duplicates(
+    client: bigquery.Client,
+    builder: QueryBuilder,
+) -> tuple[DuplicateInfo, DuplicateInfo]:
+    """Run a duplicate-key check on both tables.
+
+    Returns:
+        (duplicate_info_a, duplicate_info_b)
+    """
+    query = builder.build_duplicate_check_query()
+    row = list(client.query(query).result())[0]
+    row_dict = dict(row)
+    return (
+        DuplicateInfo(
+            duplicate_key_count=row_dict["dupes_a"],
+            duplicate_row_count=row_dict["dupe_rows_a"],
+            max_duplicate_count=row_dict["max_dupe_count_a"],
+        ),
+        DuplicateInfo(
+            duplicate_key_count=row_dict["dupes_b"],
+            duplicate_row_count=row_dict["dupe_rows_b"],
+            max_duplicate_count=row_dict["max_dupe_count_b"],
+        ),
+    )
+
+
 def generate_summary(
     client: bigquery.Client,
     builder: QueryBuilder,
@@ -648,11 +784,19 @@ def generate_summary(
     Returns:
         ComparisonSummary with all statistics
     """
+    # Run duplicate check first (cheap, no join)
+    dup_a, dup_b = check_duplicates(client, builder)
+
     if pipeline_config is not None:
-        return _generate_summary_pipeline(
+        result = _generate_summary_pipeline(
             client, builder, pipeline_config, column_sort_order, output_format
         )
-    return _generate_summary_legacy(client, builder, column_sort_order, output_format)
+    else:
+        result = _generate_summary_legacy(client, builder, column_sort_order, output_format)
+
+    result.duplicate_info_a = dup_a
+    result.duplicate_info_b = dup_b
+    return result
 
 
 def _generate_summary_pipeline(
@@ -735,6 +879,7 @@ def _generate_summary_pipeline(
             string_column_mismatches=result.string_column_mismatches or {},
             geography_column_stats=result.geography_column_stats or {},
             excluded_columns=excluded_columns,
+            column_diff_counts=result.column_diff_counts,
             column_types=column_types,
             tolerance_config=tolerance_config_display,
             rows_only_in_a_pretolerance=rows_only_in_a_pretolerance,
@@ -760,6 +905,7 @@ def _generate_summary_pipeline(
         string_column_mismatches=result.string_column_mismatches or {},
         geography_column_stats=result.geography_column_stats or {},
         excluded_columns=excluded_columns,
+        column_diff_counts=result.column_diff_counts,
         column_types=column_types,
         tolerance_config=tolerance_config_display,
         column_sort_order=column_sort_order,

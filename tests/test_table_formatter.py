@@ -5,6 +5,7 @@ import pytest
 from table_identical_checks.backend.schema import ColumnType
 from table_identical_checks.backend.summary import (
     ComparisonSummary,
+    DuplicateInfo,
     TableFormatter,
     VerboseFormatter,
     _ColumnRow,
@@ -37,6 +38,8 @@ def _make_summary(
     rows_only_in_b_pretolerance: int | None = None,
     column_sort_order: str = "alphabetical",
     output_format: str = "table",
+    duplicate_info_a: DuplicateInfo | None = None,
+    duplicate_info_b: DuplicateInfo | None = None,
 ) -> ComparisonSummary:
     return ComparisonSummary(
         table_a="proj.ds.table_a",
@@ -58,6 +61,8 @@ def _make_summary(
         rows_identical_pretolerance=rows_identical_pretolerance,
         column_sort_order=column_sort_order,
         output_format=output_format,
+        duplicate_info_a=duplicate_info_a,
+        duplicate_info_b=duplicate_info_b,
     )
 
 
@@ -903,3 +908,122 @@ class TestNonFloatToleranceColumns:
         # Split by multiple spaces to get fields
         # The tolerance columns should show "-"
         assert "NOK" in course_line
+
+
+# ---------------------------------------------------------------------------
+# Duplicate key warning tests
+# ---------------------------------------------------------------------------
+
+
+class TestDuplicateWarningTable:
+    """Tests for duplicate key warnings in TableFormatter output."""
+
+    def test_no_duplicates_no_warning(self):
+        """No warning when both tables have no duplicates."""
+        s = _make_summary(
+            duplicate_info_a=DuplicateInfo(0, 0, 0),
+            duplicate_info_b=DuplicateInfo(0, 0, 0),
+        )
+        output = str(s)
+        assert "DUPLICATE" not in output
+
+    def test_no_duplicate_info_no_warning(self):
+        """No warning when duplicate info was not collected."""
+        s = _make_summary()
+        output = str(s)
+        assert "DUPLICATE" not in output
+
+    def test_duplicates_in_table_a_only(self):
+        """Warning shown when only table A has duplicates."""
+        s = _make_summary(
+            duplicate_info_a=DuplicateInfo(5, 12, 3),
+            duplicate_info_b=DuplicateInfo(0, 0, 0),
+        )
+        output = str(s)
+        assert "DUPLICATE KEYS DETECTED" in output
+        assert "Table A: 5 duplicate key(s)" in output
+        assert "12 rows affected" in output
+        assert "max 3x per key" in output
+        # Table B should not appear in the duplicate warning section
+        assert "Table B:" not in output
+
+    def test_duplicates_in_both_tables(self):
+        """Warning shown for both tables when both have duplicates."""
+        s = _make_summary(
+            duplicate_info_a=DuplicateInfo(5, 12, 3),
+            duplicate_info_b=DuplicateInfo(10, 25, 4),
+        )
+        output = str(s)
+        assert "DUPLICATE KEYS DETECTED" in output
+        assert "Table A: 5 duplicate key(s)" in output
+        assert "Table B: 10 duplicate key(s)" in output
+
+    def test_duplicates_warning_appears_before_row_counts(self):
+        """Duplicate warning should appear before the row counts section."""
+        s = _make_summary(
+            duplicate_info_a=DuplicateInfo(5, 12, 3),
+            duplicate_info_b=DuplicateInfo(0, 0, 0),
+        )
+        output = str(s)
+        dup_pos = output.index("DUPLICATE KEYS DETECTED")
+        rows_pos = output.index("rows:")
+        assert dup_pos < rows_pos
+
+    def test_large_duplicate_counts_formatted(self):
+        """Large duplicate counts are formatted with commas."""
+        s = _make_summary(
+            duplicate_info_a=DuplicateInfo(1_234, 5_678, 99),
+            duplicate_info_b=DuplicateInfo(0, 0, 0),
+        )
+        output = str(s)
+        assert "1,234 duplicate key(s)" in output
+        assert "5,678 rows affected" in output
+
+
+class TestDuplicateWarningVerbose:
+    """Tests for duplicate key warnings in VerboseFormatter output."""
+
+    def test_no_duplicates_no_warning(self):
+        """No warning in verbose output when both tables have no duplicates."""
+        s = _make_summary(
+            output_format="verbose",
+            duplicate_info_a=DuplicateInfo(0, 0, 0),
+            duplicate_info_b=DuplicateInfo(0, 0, 0),
+        )
+        output = str(s)
+        assert "DUPLICATE" not in output
+
+    def test_duplicates_shown_in_verbose(self):
+        """Verbose formatter shows duplicate warnings."""
+        s = _make_summary(
+            output_format="verbose",
+            duplicate_info_a=DuplicateInfo(3, 8, 4),
+            duplicate_info_b=DuplicateInfo(0, 0, 0),
+        )
+        output = str(s)
+        assert "DUPLICATE KEYS DETECTED" in output
+        assert "Table A: 3 duplicate key(s)" in output
+
+    def test_duplicates_warning_before_row_counts_verbose(self):
+        """Duplicate warning should appear before ROW COUNTS in verbose."""
+        s = _make_summary(
+            output_format="verbose",
+            duplicate_info_a=DuplicateInfo(1, 2, 2),
+            duplicate_info_b=DuplicateInfo(0, 0, 0),
+        )
+        output = str(s)
+        dup_pos = output.index("DUPLICATE KEYS DETECTED")
+        rows_pos = output.index("ROW COUNTS")
+        assert dup_pos < rows_pos
+
+
+class TestDuplicateInfo:
+    """Tests for DuplicateInfo dataclass."""
+
+    def test_has_duplicates_true(self):
+        info = DuplicateInfo(1, 2, 2)
+        assert info.has_duplicates is True
+
+    def test_has_duplicates_false(self):
+        info = DuplicateInfo(0, 0, 0)
+        assert info.has_duplicates is False
