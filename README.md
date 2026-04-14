@@ -124,7 +124,7 @@ All 2 diffs fall within `0.001`, so `Exc.tol = 0` and `Status = OK` for both.
 - **Multi-layer pipeline**: The `summary` command runs as a single BQ multi-statement script with automatic circuit breaker
 - **Duplicate key detection**: Automatically checks for non-unique keys before comparison and warns prominently
 - **Per-column diff counts**: Summary output shows how many rows differ per column and the percentage
-- **Tolerance filtering** for FLOAT64 and GEOGRAPHY columns (global or per-column)
+- **Tolerance filtering** with default noise suppression (see [Tolerance](#tolerance) below)
 - **Automatic partition filter detection** via dry-run queries (works for views over partitioned tables)
 - **STRUCT flattening**: Non-repeated STRUCT/RECORD fields are recursively flattened to dot-notation sub-fields
 - **Unsupported column auto-exclusion**: ARRAY, JSON, BYTES, etc. are excluded with a warning
@@ -137,13 +137,50 @@ All 2 diffs fall within `0.001`, so `Exc.tol = 0` and `Status = OK` for both.
 | Type | Comparison | Delta Calculation | Tolerance |
 |------|------------|-------------------|-----------|
 | INT64 | Exact (NULL-safe) | `a - b`, `ABS(a - b)`, `SAFE_DIVIDE(a - b, b)` | No |
-| FLOAT64 | Delta metrics | Same as INT64 | Yes (`ABS(a - b) <= tol`) |
+| FLOAT64 | Delta metrics | Same as INT64 | Yes (absolute and/or relative) |
 | STRING | Exact (NULL-safe) | Match flag (boolean) | No |
 | TIMESTAMP | Exact (NULL-safe) | `TIMESTAMP_DIFF(a, b, MICROSECOND)` | No |
 | BOOLEAN | Cast to INT64 | Treated as integer (0/1) | No |
 | GEOGRAPHY | `ST_EQUALS` (NULL-safe) | `ST_DISTANCE(a, b, TRUE)` in meters | Yes (`ST_DISTANCE(a, b) <= tol`) |
 | STRUCT/RECORD | Flattened to sub-fields | Per sub-field (by type) | Per sub-field |
 | ARRAY, JSON, etc. | Auto-excluded | N/A | N/A |
+
+## Tolerance
+
+Float comparisons use two tolerance thresholds to filter IEEE 754 floating-point
+noise. Both apply by default and are combined with OR -- a value is within
+tolerance if **either** condition holds:
+
+| Threshold | Default | Formula | Purpose |
+|-----------|---------|---------|---------|
+| `--tolerance` (absolute) | `1e-15` | `ABS(a - b) <= tol` | Catches noise near zero |
+| `--rel-tolerance` (relative) | `1e-12` | `ABS(a - b) / GREATEST(ABS(a), ABS(b)) <= rel_tol` | Catches noise at any scale |
+
+```bash
+# Use defaults (recommended for most cases)
+table-check summary --table-a=... --table-b=... --keys=id
+
+# Custom thresholds
+table-check summary ... --tolerance=1e-9 --rel-tolerance=1e-6
+
+# Disable tolerance entirely (exact comparison)
+table-check summary ... --tolerance=0 --rel-tolerance=0
+```
+
+Rows are only filtered when **all** toleranced columns are within tolerance **and**
+all non-toleranced columns (boolean, string, integer, timestamp) are exactly equal.
+
+**Caveats:**
+- Relative tolerance uses `SAFE_DIVIDE`, which returns NULL (not within tolerance) when
+  dividing by zero. Values near zero are handled by the absolute tolerance instead.
+- There is a narrow gap for small-but-not-tiny values: if one value is 0 and the other is
+  between 1e-15 and ~1e-12, neither tolerance catches it. In practice this is rarely
+  meaningful for BigQuery analytics data.
+- GEOGRAPHY columns only support absolute tolerance (`ST_DISTANCE <= tol` in meters).
+  Relative tolerance does not apply to geography comparisons.
+- Per-column overrides combine with global defaults via OR:
+  `--tolerance=col1:0.01 --rel-tolerance=1e-6` means `col1` is within tolerance
+  if `abs_delta <= 0.01` OR `rel_delta <= 1e-6`.
 
 ## Testing
 

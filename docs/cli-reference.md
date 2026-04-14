@@ -2,6 +2,8 @@
 
 All commands accept `--credentials` (path to service account JSON, defaults to `$GOOGLE_APPLICATION_CREDENTIALS`) and partition filters (`--partition-filter-a`, `--partition-filter-b`) for tables that require partition elimination.
 
+All commands apply default float tolerance (`--tolerance=1e-15`, `--rel-tolerance=1e-12`) to filter IEEE 754 noise. Pass `0` to disable either. See [Tolerance](../README.md#tolerance) for details.
+
 ## `table-check diff`
 
 Compare two tables and show differing rows.
@@ -11,7 +13,8 @@ Compare two tables and show differing rows.
 | `--table-a` | TEXT | (required) | First table (project.dataset.table) |
 | `--table-b` | TEXT | (required) | Second table (project.dataset.table) |
 | `--keys` | TEXT | (required) | Comma-separated key columns for joining |
-| `--tolerance` | TEXT | None | Float/geography tolerance (e.g., `1e-9` or `col1:1e-9,col2:1e-6`) |
+| `--tolerance` | TEXT | 1e-15 | Absolute float tolerance. Pass `0` to disable. |
+| `--rel-tolerance` | TEXT | 1e-12 | Relative float tolerance. Pass `0` to disable. |
 | `--dry-run` | FLAG | False | Print generated SQL without executing |
 | `--limit` | INT | 100 | Max rows to return (stdout mode only) |
 | `--output-table` | TEXT | None | Persist diff to this BQ table (DDL) |
@@ -29,7 +32,8 @@ Count the number of differing rows between two tables.
 | `--table-a` | TEXT | (required) | First table |
 | `--table-b` | TEXT | (required) | Second table |
 | `--keys` | TEXT | (required) | Comma-separated key columns |
-| `--tolerance` | TEXT | None | Float/geography tolerance |
+| `--tolerance` | TEXT | 1e-15 | Absolute float tolerance. Pass `0` to disable. |
+| `--rel-tolerance` | TEXT | 1e-12 | Relative float tolerance. Pass `0` to disable. |
 
 ## `table-check summary`
 
@@ -40,7 +44,8 @@ Generate a comprehensive comparison summary (single BQ job via pipeline).
 | `--table-a` | TEXT | (required) | First table |
 | `--table-b` | TEXT | (required) | Second table |
 | `--keys` | TEXT | (required) | Comma-separated key columns |
-| `--tolerance` | TEXT | None | Float/geography tolerance |
+| `--tolerance` | TEXT | 1e-15 | Absolute float tolerance. Pass `0` to disable. |
+| `--rel-tolerance` | TEXT | 1e-12 | Relative float tolerance. Pass `0` to disable. |
 | `--format` | CHOICE | verbose | Output format: `verbose` or `table` |
 | `--sort-columns` | CHOICE | alphabetical | Sort: `alphabetical` or `significance` |
 | `--max-diff-pct` | FLOAT | 10.0 | Circuit breaker: abort if >X% of rows differ |
@@ -58,4 +63,5 @@ Generate comparison summary broken down by a dimension.
 | `--dimension` | TEXT | (required) | Column to break down by (e.g., date) |
 | `--delta-col` | TEXT | None | Numeric column to track max deltas for |
 | `--limit` | INT | None | Limit number of dimension buckets |
-| `--tolerance` | TEXT | None | Float/geography tolerance |
+| `--tolerance` | TEXT | 1e-15 | Absolute float tolerance. Pass `0` to disable. |
+| `--rel-tolerance` | TEXT | 1e-12 | Relative float tolerance. Pass `0` to disable. |
