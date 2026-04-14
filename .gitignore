@@ -36,6 +36,10 @@ sa.json
 .env
 .envrc.local
 
+# Claude Code
+.claude/
+CLAUDE.md
+
 # OS
 .DS_Store
 Thumbs.db
