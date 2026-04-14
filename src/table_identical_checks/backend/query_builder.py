@@ -178,15 +178,14 @@ class QueryBuilder:
 
                 # Add within_tolerance flag for FLOAT columns if tolerance configured
                 if col.column_type == ColumnType.FLOAT and self.tolerance_config:
-                    tolerance = self.tolerance_config.get_tolerance(col.name)
-                    if tolerance is not None:
-                        # Add boolean column indicating if abs_delta is within tolerance
-                        within_tol_expr = (
-                            f"ABS({self.alias_a}.{col.name} - "
-                            f"{self.alias_b}.{col.name}) <= {tolerance}"
-                        )
+                    if self.tolerance_config.has_any_tolerance(col.name):
+                        a_ref = f"{self.alias_a}.{col.name}"
+                        b_ref = f"{self.alias_b}.{col.name}"
+                        within_tol_expr = self._float_within_tol_sql(a_ref, b_ref, col.name)
                         select_cols.append(
-                            literal_column(within_tol_expr).label(f"{col.name}__within_tolerance")
+                            literal_column(f"({within_tol_expr})").label(
+                                f"{col.name}__within_tolerance"
+                            )
                         )
 
             elif col.column_type == ColumnType.BOOLEAN:
@@ -395,14 +394,13 @@ class QueryBuilder:
 
         for col in self._value_columns():
             if col.column_type == ColumnType.FLOAT:
-                tolerance = self.tolerance_config.get_tolerance(col.name)
-                if tolerance is not None:
+                if self.tolerance_config.has_any_tolerance(col.name):
                     float_cols_with_tolerance.append(col)
                 else:
                     float_cols_without_tolerance.append(col)
             elif col.column_type == ColumnType.GEOGRAPHY:
-                tolerance = self.tolerance_config.get_tolerance(col.name)
-                if tolerance is not None:
+                # Geography only supports absolute tolerance, not relative
+                if self.tolerance_config.get_tolerance(col.name) is not None:
                     geo_cols_with_tolerance.append(col)
                 else:
                     geo_cols_without_tolerance.append(col)
@@ -427,20 +425,20 @@ class QueryBuilder:
 
         # Condition 3: All float columns WITH tolerance must be within tolerance
         for col in float_cols_with_tolerance:
-            tolerance = self.tolerance_config.get_tolerance(col.name)
             col_a = table_a_obj.c[col.name]
             col_b = table_b_obj.c[col.name]
+            a_ref = f"{self.alias_a}.{col.name}"
+            b_ref = f"{self.alias_b}.{col.name}"
 
-            # abs_delta <= tolerance OR both are NULL
-            # Only calculate ABS when both values are not NULL to avoid SQL errors
+            # within_tol OR both are NULL
+            # Only calculate when both values are not NULL to avoid SQL errors
+            wt_expr = self._float_within_tol_sql(a_ref, b_ref, col.name)
             within_tolerance_or_null = or_(
                 and_(col_a.is_(None), col_b.is_(None)),
                 and_(
                     col_a.isnot(None),
                     col_b.isnot(None),
-                    literal_column(
-                        f"ABS({self.alias_a}.{col.name} - {self.alias_b}.{col.name}) <= {tolerance}"
-                    ),
+                    literal_column(f"({wt_expr})"),
                 ),
             )
             exclusion_conditions.append(within_tolerance_or_null)
@@ -453,16 +451,18 @@ class QueryBuilder:
         # Note: ST_DISTANCE without use_spheroid because BQ rewrites <=
         # comparisons to ST_DWITHIN which does not support use_spheroid=TRUE.
         for col in geo_cols_with_tolerance:
-            tolerance = self.tolerance_config.get_tolerance(col.name)
+            abs_tol = self.tolerance_config.get_tolerance(col.name)
             a = f"{self.alias_a}.{col.name}"
             b = f"{self.alias_b}.{col.name}"
             # ST_DISTANCE <= tolerance OR both are NULL
-            within_tolerance_or_null = literal_column(
-                f"(({a} IS NULL AND {b} IS NULL) OR "
-                f"({a} IS NOT NULL AND {b} IS NOT NULL AND "
-                f"ST_DISTANCE({a}, {b}) <= {tolerance}))"
-            )
-            exclusion_conditions.append(within_tolerance_or_null)
+            # (geography only supports absolute tolerance, not relative)
+            if abs_tol is not None:
+                within_tolerance_or_null = literal_column(
+                    f"(({a} IS NULL AND {b} IS NULL) OR "
+                    f"({a} IS NOT NULL AND {b} IS NOT NULL AND "
+                    f"ST_DISTANCE({a}, {b}) <= {abs_tol}))"
+                )
+                exclusion_conditions.append(within_tolerance_or_null)
 
         # Row should be excluded if ALL conditions are met
         return and_(*exclusion_conditions)
@@ -659,6 +659,32 @@ class QueryBuilder:
             f"OR ({a} IS NOT NULL AND {b} IS NOT NULL AND ST_EQUALS({a}, {b})))"
         )
 
+    def _float_within_tol_sql(self, a: str, b: str, col_name: str) -> str:
+        """Build a raw SQL expression for float within-tolerance check.
+
+        Combines absolute and relative tolerance with OR:
+        - ABS(a - b) <= abs_tol
+        - ABS(a - b) / GREATEST(ABS(a), ABS(b)) <= rel_tol
+
+        Returns SQL that evaluates to TRUE when the values are within tolerance.
+        """
+        abs_tol = self.tolerance_config.get_tolerance(col_name) if self.tolerance_config else None
+        rel_tol = (
+            self.tolerance_config.get_rel_tolerance(col_name) if self.tolerance_config else None
+        )
+
+        parts = []
+        if abs_tol is not None:
+            parts.append(f"ABS({a} - {b}) <= {abs_tol}")
+        if rel_tol is not None:
+            parts.append(
+                f"SAFE_DIVIDE(ABS({a} - {b}), GREATEST(ABS({a}), ABS({b}))) <= {rel_tol}"
+            )
+
+        if not parts:
+            return "TRUE"
+        return " OR ".join(parts) if len(parts) > 1 else parts[0]
+
     @staticmethod
     def _safe_alias(name: str) -> str:
         """Mangle a column alias to avoid dots, which are illegal in BQ temp table columns.
@@ -696,14 +722,18 @@ class QueryBuilder:
         value_cols = self._value_columns()
         first_key = self.key_columns[0]
 
-        # Build tolerance config for display
-        tol_config: dict[str, float] = {}
+        # Build set of columns that have any tolerance configured (abs or rel)
+        # Build set of columns that have any tolerance configured.
+        # Relative tolerance only applies to FLOAT, not GEOGRAPHY (which uses meters).
+        tol_cols: set[str] = set()
         if self.tolerance_config:
             for col in value_cols:
-                if col.column_type in (ColumnType.FLOAT, ColumnType.GEOGRAPHY):
-                    tol = self.tolerance_config.get_tolerance(col.name)
-                    if tol is not None:
-                        tol_config[col.name] = tol
+                if col.column_type == ColumnType.FLOAT:
+                    if self.tolerance_config.has_any_tolerance(col.name):
+                        tol_cols.add(col.name)
+                elif col.column_type == ColumnType.GEOGRAPHY:
+                    if self.tolerance_config.get_tolerance(col.name) is not None:
+                        tol_cols.add(col.name)
 
         # --- Preamble: all DECLARE statements first, then SET ---
         source_a = self._table_source(self.table_a, "t", self.partition_filter_a)
@@ -807,10 +837,10 @@ class QueryBuilder:
                     ]
                 )
                 # within_tol for FLOAT columns with tolerance
-                if col.column_type == ColumnType.FLOAT and col.name in tol_config:
-                    tol = tol_config[col.name]
+                if col.column_type == ColumnType.FLOAT and col.name in tol_cols:
+                    wt_expr = self._float_within_tol_sql(a, b, col.name)
                     l2_select_parts.append(
-                        f"  ABS({a} - {b}) <= {tol} AS {sa(f'{col.name}__within_tol')}"
+                        f"  ({wt_expr}) AS {sa(f'{col.name}__within_tol')}"
                     )
 
             elif col.column_type == ColumnType.BOOLEAN:
@@ -847,14 +877,15 @@ class QueryBuilder:
                 sa = self._safe_alias
                 dist = f"IF({a} IS NOT NULL AND {b} IS NOT NULL, ST_DISTANCE({a}, {b}, TRUE), NULL)"
                 l2_select_parts.append(f"  {dist} AS {sa(f'{col.name}__distance_m')}")
-                if col.name in tol_config:
-                    tol = tol_config[col.name]
-                    # Use spherical (no use_spheroid) for tolerance to avoid ST_DWITHIN rewrite
-                    l2_select_parts.append(
-                        f"  IF({a} IS NOT NULL AND {b} IS NOT NULL, "
-                        f"ST_DISTANCE({a}, {b}) <= {tol}, "
-                        f"{a} IS NULL AND {b} IS NULL) AS {sa(f'{col.name}__within_tol')}"
-                    )
+                if col.name in tol_cols:
+                    tol = self.tolerance_config.get_tolerance(col.name)
+                    if tol is not None:
+                        # Use spherical (no use_spheroid) for tolerance to avoid ST_DWITHIN rewrite
+                        l2_select_parts.append(
+                            f"  IF({a} IS NOT NULL AND {b} IS NOT NULL, "
+                            f"ST_DISTANCE({a}, {b}) <= {tol}, "
+                            f"{a} IS NULL AND {b} IS NULL) AS {sa(f'{col.name}__within_tol')}"
+                        )
 
         l2_select = ",\n".join(l2_select_parts)
 
@@ -918,7 +949,7 @@ class QueryBuilder:
                         f" AS {sa(f'{col.name}__sum_abs_rel_delta')}",
                     ]
                 )
-                if col.column_type == ColumnType.FLOAT and col.name in tol_config:
+                if col.column_type == ColumnType.FLOAT and col.name in tol_cols:
                     wt = sa(f"{col.name}__within_tol")
                     l3_stats_parts.extend(
                         [
@@ -946,7 +977,7 @@ class QueryBuilder:
                         f" AS {sa(f'{col.name}__avg_distance_m')}",
                     ]
                 )
-                if col.name in tol_config:
+                if col.name in tol_cols:
                     wt = sa(f"{col.name}__within_tol")
                     l3_stats_parts.extend(
                         [
@@ -957,10 +988,20 @@ class QueryBuilder:
                     )
                     tol_col_within_flags.append(wt)
 
-        # Post-tolerance diff count: rows where NOT all toleranced columns are within tol
+        # Post-tolerance diff count: rows where the row is NOT fully within tolerance.
+        # A row is "within tolerance" only if:
+        #   1. ALL toleranced columns are within tolerance, AND
+        #   2. ALL non-toleranced value columns are equal (eq flag from Layer 1)
         if tol_col_within_flags:
-            all_within = " AND ".join(tol_col_within_flags)
-            l3_stats_parts.append(f"  COUNTIF(NOT ({all_within})) AS post_tol_diff_count")
+            sa = self._safe_alias
+            non_tol_eq_flags = [
+                sa(f"{col.name}__eq")
+                for col in value_cols
+                if col.name not in tol_cols
+            ]
+            all_ok_parts = tol_col_within_flags + non_tol_eq_flags
+            all_ok = " AND ".join(all_ok_parts)
+            l3_stats_parts.append(f"  COUNTIF(NOT ({all_ok})) AS post_tol_diff_count")
 
         l3_stats = ",\n".join(l3_stats_parts)
 

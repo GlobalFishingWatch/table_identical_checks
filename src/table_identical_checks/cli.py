@@ -19,6 +19,37 @@ from .backend import (
 )
 
 
+# Default tolerance values for filtering IEEE 754 float noise.
+# Relative handles large values; absolute handles near-zero values.
+# Combined via OR: a value is within tolerance if EITHER condition holds.
+DEFAULT_ABS_TOLERANCE = "1e-15"
+DEFAULT_REL_TOLERANCE = "1e-12"
+
+
+def _parse_tolerance(tolerance: str | None, rel_tolerance: str | None) -> ToleranceConfig | None:
+    """Parse and merge absolute and relative tolerance CLI arguments.
+
+    When neither is specified, applies sensible defaults (abs=1e-15, rel=1e-12)
+    to filter IEEE 754 floating-point noise. Pass '0' to either to disable.
+    """
+    # Apply defaults when neither is specified
+    if tolerance is None and rel_tolerance is None:
+        tolerance = DEFAULT_ABS_TOLERANCE
+        rel_tolerance = DEFAULT_REL_TOLERANCE
+
+    # '0' disables that tolerance type
+    abs_config = ToleranceConfig.parse(tolerance) if tolerance and tolerance != "0" else None
+    rel_config = (
+        ToleranceConfig.parse_rel(rel_tolerance)
+        if rel_tolerance and rel_tolerance != "0"
+        else None
+    )
+
+    if abs_config and rel_config:
+        return abs_config.merge(rel_config)
+    return abs_config or rel_config
+
+
 def get_partition_filters(
     client: bigquery.Client,
     table_a: str,
@@ -235,7 +266,12 @@ def main():
 @click.option(
     "--tolerance",
     default=None,
-    help="Tolerance for float comparisons (e.g., '1e-9' or 'col1:1e-9,col2:1e-6')",
+    help="Absolute tolerance for floats (default: 1e-15). Pass '0' to disable. (e.g., '1e-9' or 'col1:1e-9')",
+)
+@click.option(
+    "--rel-tolerance",
+    default=None,
+    help="Relative tolerance for floats (default: 1e-12). Pass '0' to disable. (e.g., '1e-9' or 'col1:1e-9')",
 )
 @click.option("--dry-run", is_flag=True, help="Print query without executing")
 @click.option("--limit", default=100, help="Max rows to return")
@@ -266,6 +302,7 @@ def diff(
     partition_filter_a: str | None,
     partition_filter_b: str | None,
     tolerance: str | None,
+    rel_tolerance: str | None,
     dry_run: bool,
     limit: int,
     output_table: str | None,
@@ -295,7 +332,7 @@ def diff(
     )
 
     # Parse tolerance config
-    tolerance_config = ToleranceConfig.parse(tolerance) if tolerance else None
+    tolerance_config = _parse_tolerance(tolerance, rel_tolerance)
 
     # Build the query builder
     builder = QueryBuilder(
@@ -374,7 +411,12 @@ def diff(
 @click.option(
     "--tolerance",
     default=None,
-    help="Tolerance for float comparisons (e.g., '1e-9' or 'col1:1e-9,col2:1e-6')",
+    help="Absolute tolerance for floats (default: 1e-15). Pass '0' to disable. (e.g., '1e-9' or 'col1:1e-9')",
+)
+@click.option(
+    "--rel-tolerance",
+    default=None,
+    help="Relative tolerance for floats (default: 1e-12). Pass '0' to disable. (e.g., '1e-9' or 'col1:1e-9')",
 )
 def count(
     table_a: str,
@@ -384,6 +426,7 @@ def count(
     partition_filter_a: str | None,
     partition_filter_b: str | None,
     tolerance: str | None,
+    rel_tolerance: str | None,
 ):
     """Count the number of differing rows between two tables."""
     key_columns = [k.strip() for k in keys.split(",")]
@@ -401,7 +444,7 @@ def count(
     )
 
     # Parse tolerance config
-    tolerance_config = ToleranceConfig.parse(tolerance) if tolerance else None
+    tolerance_config = _parse_tolerance(tolerance, rel_tolerance)
 
     builder = QueryBuilder(
         table_a=table_a,
@@ -434,7 +477,12 @@ def count(
 @click.option(
     "--tolerance",
     default=None,
-    help="Tolerance for float comparisons (e.g., '1e-9' or 'col1:1e-9,col2:1e-6')",
+    help="Absolute tolerance for floats (default: 1e-15). Pass '0' to disable. (e.g., '1e-9' or 'col1:1e-9')",
+)
+@click.option(
+    "--rel-tolerance",
+    default=None,
+    help="Relative tolerance for floats (default: 1e-12). Pass '0' to disable. (e.g., '1e-9' or 'col1:1e-9')",
 )
 @click.option(
     "--sort-columns",
@@ -469,6 +517,7 @@ def summary(
     partition_filter_a: str | None,
     partition_filter_b: str | None,
     tolerance: str | None,
+    rel_tolerance: str | None,
     sort_columns: str,
     output_format: str,
     max_diff_pct: float,
@@ -492,7 +541,7 @@ def summary(
     )
 
     # Parse tolerance config
-    tolerance_config = ToleranceConfig.parse(tolerance) if tolerance else None
+    tolerance_config = _parse_tolerance(tolerance, rel_tolerance)
 
     builder = QueryBuilder(
         table_a=table_a,
@@ -533,7 +582,12 @@ def summary(
 @click.option(
     "--tolerance",
     default=None,
-    help="Tolerance for float comparisons (e.g., '1e-9' or 'col1:1e-9,col2:1e-6')",
+    help="Absolute tolerance for floats (default: 1e-15). Pass '0' to disable. (e.g., '1e-9' or 'col1:1e-9')",
+)
+@click.option(
+    "--rel-tolerance",
+    default=None,
+    help="Relative tolerance for floats (default: 1e-12). Pass '0' to disable. (e.g., '1e-9' or 'col1:1e-9')",
 )
 def breakdown(
     table_a: str,
@@ -546,6 +600,7 @@ def breakdown(
     partition_filter_a: str | None,
     partition_filter_b: str | None,
     tolerance: str | None,
+    rel_tolerance: str | None,
 ):
     """Generate comparison summary broken down by a dimension."""
     key_columns = [k.strip() for k in keys.split(",")]
@@ -564,7 +619,7 @@ def breakdown(
     )
 
     # Parse tolerance config
-    tolerance_config = ToleranceConfig.parse(tolerance) if tolerance else None
+    tolerance_config = _parse_tolerance(tolerance, rel_tolerance)
 
     builder = QueryBuilder(
         table_a=table_a,

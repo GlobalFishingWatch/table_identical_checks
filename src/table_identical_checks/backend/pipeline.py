@@ -97,13 +97,15 @@ def _parse_pipeline_result(row: bigquery.Row, builder: QueryBuilder) -> Pipeline
         return result
 
     # Build tolerance config lookup
-    tol_config: dict[str, float] = {}
+    tol_cols: set[str] = set()
     if builder.tolerance_config:
         for col in value_cols:
-            if col.column_type in (ColumnType.FLOAT, ColumnType.GEOGRAPHY):
-                tol = builder.tolerance_config.get_tolerance(col.name)
-                if tol is not None:
-                    tol_config[col.name] = tol
+            if col.column_type == ColumnType.FLOAT:
+                if builder.tolerance_config.has_any_tolerance(col.name):
+                    tol_cols.add(col.name)
+            elif col.column_type == ColumnType.GEOGRAPHY:
+                if builder.tolerance_config.get_tolerance(col.name) is not None:
+                    tol_cols.add(col.name)
 
     # Parse Layer 3 stats
     numeric_stats: dict[str, dict] = {}
@@ -129,7 +131,7 @@ def _parse_pipeline_result(row: bigquery.Row, builder: QueryBuilder) -> Pipeline
                     "avg_abs_delta": row_dict.get(_alias(col.name, "avg_abs_delta")),
                     "sum_abs_rel_delta": row_dict.get(_alias(col.name, "sum_abs_rel_delta")),
                 }
-                if col.column_type == ColumnType.FLOAT and col.name in tol_config:
+                if col.column_type == ColumnType.FLOAT and col.name in tol_cols:
                     stats["within_tolerance_count"] = row_dict.get(
                         _alias(col.name, "within_tol_count")
                     )
@@ -150,7 +152,7 @@ def _parse_pipeline_result(row: bigquery.Row, builder: QueryBuilder) -> Pipeline
                     "max_distance_meters": max_dist,
                     "avg_distance_meters": row_dict.get(_alias(col.name, "avg_distance_m")),
                 }
-                if col.name in tol_config:
+                if col.name in tol_cols:
                     geo_stats["within_tolerance_count"] = row_dict.get(
                         _alias(col.name, "within_tol_count")
                     )

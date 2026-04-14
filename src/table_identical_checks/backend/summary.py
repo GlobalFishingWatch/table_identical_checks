@@ -379,13 +379,22 @@ class TableFormatter:
         # keys & tolerance one-liner
         keys_str = f"keys: {', '.join(summary.key_columns)}"
         if summary.has_tolerance:
-            # Display the first tolerance value or "(per-column)" if they differ
-            unique_tols = set(summary.tolerance_config.values())
-            if len(unique_tols) == 1:
-                tol_str = f"tol: {next(iter(unique_tols))}"
-            else:
-                tol_str = "tol: per-column"
-            lines.append(f"{keys_str} | {tol_str}")
+            tol_parts = []
+            if summary.tolerance_config:
+                unique_abs = set(summary.tolerance_config.values())
+                tol_parts.append(
+                    f"tol: {next(iter(unique_abs))}"
+                    if len(unique_abs) == 1
+                    else "tol: per-column"
+                )
+            if summary.rel_tolerance_config:
+                unique_rel = set(summary.rel_tolerance_config.values())
+                tol_parts.append(
+                    f"rel_tol: {next(iter(unique_rel))}"
+                    if len(unique_rel) == 1
+                    else "rel_tol: per-column"
+                )
+            lines.append(f"{keys_str} | {' | '.join(tol_parts)}")
         else:
             lines.append(keys_str)
 
@@ -687,7 +696,8 @@ class ComparisonSummary:
     column_types: dict[str, ColumnType] = field(default_factory=dict)  # col -> ColumnType
 
     # Tolerance configuration (optional)
-    tolerance_config: dict[str, float] | None = None  # col -> tolerance value
+    tolerance_config: dict[str, float] | None = None  # col -> abs tolerance value
+    rel_tolerance_config: dict[str, float] | None = None  # col -> rel tolerance value
 
     # Pre-tolerance counts (optional, only present if tolerance is configured)
     rows_only_in_a_pretolerance: int | None = None
@@ -725,7 +735,9 @@ class ComparisonSummary:
 
     @property
     def has_tolerance(self) -> bool:
-        return self.tolerance_config is not None and len(self.tolerance_config) > 0
+        has_abs = self.tolerance_config is not None and len(self.tolerance_config) > 0
+        has_rel = self.rel_tolerance_config is not None and len(self.rel_tolerance_config) > 0
+        return has_abs or has_rel
 
     def __str__(self) -> str:
         formatter = get_formatter(self.output_format)
@@ -816,13 +828,23 @@ def _generate_summary_pipeline(
 
     # Build tolerance config for display
     tolerance_config_display = None
+    rel_tolerance_config_display = None
     if builder.tolerance_config:
         tolerance_config_display = {}
+        rel_tolerance_config_display = {}
         for col in builder.columns:
             if col.column_type in (ColumnType.FLOAT, ColumnType.GEOGRAPHY):
                 tol = builder.tolerance_config.get_tolerance(col.name)
                 if tol is not None:
                     tolerance_config_display[col.name] = tol
+                rel_tol = builder.tolerance_config.get_rel_tolerance(col.name)
+                if rel_tol is not None:
+                    rel_tolerance_config_display[col.name] = rel_tol
+        # Set to None if empty
+        if not tolerance_config_display:
+            tolerance_config_display = None
+        if not rel_tolerance_config_display:
+            rel_tolerance_config_display = None
 
     # Build column_types mapping and excluded columns list
     value_columns = [
@@ -844,7 +866,10 @@ def _generate_summary_pipeline(
     # Layer 1 always finds ALL non-identical rows (no tolerance filtering).
     # The pipeline's rows_in_both_with_differences is the pre-tolerance count.
     # For post-tolerance: use Layer 3's post_tol_diff_count if available.
-    has_tolerance = tolerance_config_display is not None and len(tolerance_config_display) > 0
+    has_tolerance = (
+        (tolerance_config_display is not None and len(tolerance_config_display) > 0)
+        or (rel_tolerance_config_display is not None and len(rel_tolerance_config_display) > 0)
+    )
 
     if has_tolerance and result.pipeline_status == "COMPLETED":
         # Pre-tolerance counts come directly from Layer 1
@@ -882,6 +907,7 @@ def _generate_summary_pipeline(
             column_diff_counts=result.column_diff_counts,
             column_types=column_types,
             tolerance_config=tolerance_config_display,
+            rel_tolerance_config=rel_tolerance_config_display,
             rows_only_in_a_pretolerance=rows_only_in_a_pretolerance,
             rows_only_in_b_pretolerance=rows_only_in_b_pretolerance,
             rows_in_both_with_differences_pretolerance=rows_in_both_pretolerance,
@@ -908,6 +934,7 @@ def _generate_summary_pipeline(
         column_diff_counts=result.column_diff_counts,
         column_types=column_types,
         tolerance_config=tolerance_config_display,
+        rel_tolerance_config=rel_tolerance_config_display,
         column_sort_order=column_sort_order,
         output_format=output_format,
     )
@@ -950,13 +977,22 @@ def _generate_summary_legacy(
 
     # Build tolerance config for display (includes both FLOAT and GEOGRAPHY columns)
     tolerance_config_display = None
+    rel_tolerance_config_display = None
     if builder.tolerance_config:
         tolerance_config_display = {}
+        rel_tolerance_config_display = {}
         for col in builder.columns:
             if col.column_type in (ColumnType.FLOAT, ColumnType.GEOGRAPHY):
                 tol = builder.tolerance_config.get_tolerance(col.name)
                 if tol is not None:
                     tolerance_config_display[col.name] = tol
+                rel_tol = builder.tolerance_config.get_rel_tolerance(col.name)
+                if rel_tol is not None:
+                    rel_tolerance_config_display[col.name] = rel_tol
+        if not tolerance_config_display:
+            tolerance_config_display = None
+        if not rel_tolerance_config_display:
+            rel_tolerance_config_display = None
 
     # Build diff queries
     diff_query = builder.build_diff_query(apply_tolerance=True)
@@ -1159,6 +1195,7 @@ def _generate_summary_legacy(
         excluded_columns=excluded_columns,
         column_types=column_types,
         tolerance_config=tolerance_config_display,
+        rel_tolerance_config=rel_tolerance_config_display,
         rows_only_in_a_pretolerance=rows_only_in_a_pretolerance,
         rows_only_in_b_pretolerance=rows_only_in_b_pretolerance,
         rows_in_both_with_differences_pretolerance=rows_in_both_with_differences_pretolerance,
