@@ -56,7 +56,8 @@ See [docs/cli-reference.md](docs/cli-reference.md) for full option details.
 
 ## Example Output
 
-Comparing two versions of a vessel info table (623 rows, 29 value columns):
+Comparing two versions of a vessel info table (623 rows, 29 value columns).
+Default tolerances (abs=1e-15, rel=1e-12) apply automatically:
 
 ```
 $ table-check summary \
@@ -66,58 +67,26 @@ $ table-check summary \
 
 ================================================================================
 =============================== table comparison ===============================
-pipe_ais_test_202408250000_published.vessel_info vs pipe_ais_test_202408290000_published.vessel_info
-keys: vessel_id
-
-rows: 623 vs 623 | diffs: 2
-
-Identical columns: callsign.count, callsign.freq, callsign.value, first_timestamp,
-  imo.count, imo.freq, imo.value, last_timestamp, length.count, length.freq,
-  length.value, msg_count, n_callsign.count, n_callsign.freq, n_callsign.value,
-  n_imo.count, n_imo.freq, n_imo.value, n_shipname.count, n_shipname.value,
-  pos_count, shipname.count, shipname.value, ssvid, width.count, width.freq,
-  width.value
-
---------------------------------------------------------------------------------
-Column                   Type           Diffs     Diff%      MaxAbs      MaxRel      AvgAbs  Status
----------------------------------------------------------------------------------------------------
-n_shipname.freq           FLT               2     0.32%     1.0e-04     2.1e-04     7.1e-05     NOK
-shipname.freq             FLT               2     0.32%     1.0e-04     2.1e-04     7.1e-05     NOK
-================================================================================
-============================== DIFFERENCES FOUND ===============================
-```
-
-Out of 29 value columns (including flattened STRUCT sub-fields), only 2 rows differ in 2 columns.
-
-Adding `--tolerance=0.001` filters out those small float differences -- both columns
-flip to `OK` and the overall result becomes `IDENTICAL`:
-
-```
-$ table-check summary \
-    --table-a=pipe_ais_test_202408250000_published.vessel_info \
-    --table-b=pipe_ais_test_202408290000_published.vessel_info \
-    --keys=vessel_id --format=table --tolerance=0.001
-
-================================================================================
-=============================== table comparison ===============================
 ...vessel_info vs ...vessel_info
-keys: vessel_id | tol: 0.001
+keys: vessel_id | tol: 1e-15 | rel_tol: 1e-12
 
-rows: 623 vs 623 | diffs: 2 (filtered 2)
+rows: 623 vs 623 | diffs: 2 (filtered 0)
 
 Identical columns: callsign.count, callsign.freq, callsign.value, ...
 
 --------------------------------------------------------------------------------
 Column                   Type           Diffs     Diff%      MaxAbs      MaxRel      AvgAbs      Exc.tol   Within tol  Status
 -----------------------------------------------------------------------------------------------------------------------------
-n_shipname.freq           FLT               2     0.32%     1.0e-04     2.1e-04     7.1e-05            0            2      OK
-shipname.freq             FLT               2     0.32%     1.0e-04     2.1e-04     7.1e-05            0            2      OK
+n_shipname.freq           FLT               2     0.32%     1.0e-04     2.1e-04     7.1e-05            2            0     NOK
+shipname.freq             FLT               2     0.32%     1.0e-04     2.1e-04     7.1e-05            2            0     NOK
 ================================================================================
-===================================IDENTICAL====================================
+============================== DIFFERENCES FOUND ===============================
 ```
 
-The `Exc.tol` (exceeding tolerance) and `Within tol` columns appear when tolerance is active.
-All 2 diffs fall within `0.001`, so `Exc.tol = 0` and `Status = OK` for both.
+Out of 29 value columns (including flattened STRUCT sub-fields), only 2 rows differ
+in 2 columns. The default tolerances are tight enough to filter IEEE 754 noise but
+not these real differences (max relative delta 2.1e-04 far exceeds 1e-12).
+`Exc.tol = 2` means both diffs exceed tolerance, so `Status = NOK`.
 
 ## Features
 
