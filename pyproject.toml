@@ -62,7 +62,10 @@ select = ["E", "F", "I", "W"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "--cov=table_identical_checks --cov-report=term-missing --cov-report=xml"
+addopts = "-m 'not bq' --cov=table_identical_checks --cov-report=term-missing --cov-report=xml"
+markers = [
+    "bq: tests that require a live BigQuery connection (deselected by default)",
+]
 
 [tool.coverage.run]
 source = ["src/table_identical_checks"]

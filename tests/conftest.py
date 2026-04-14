@@ -9,6 +9,17 @@ from google.cloud import bigquery
 TEST_PROJECT = "world-fishing-827"
 TEST_DATASET = "tech_great_expectations"
 
+# Fixtures whose presence marks a test as requiring BigQuery
+_BQ_FIXTURES = {"bq_client", "table_factory", "test_dataset"}
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-mark tests that use BigQuery fixtures with the 'bq' marker."""
+    bq_marker = pytest.mark.bq
+    for item in items:
+        if _BQ_FIXTURES & set(item.fixturenames):
+            item.add_marker(bq_marker)
+
 
 @pytest.fixture(scope="session")
 def bq_client():
