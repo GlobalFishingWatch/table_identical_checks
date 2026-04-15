@@ -414,17 +414,26 @@ class TableFormatter:
             lines.append("")
 
         # -- row counts -------------------------------------------------------
-        row_line = f"rows: {summary.total_rows_a:,} vs {summary.total_rows_b:,}"
+        lines.append(f"rows: {summary.total_rows_a:,} vs {summary.total_rows_b:,}")
+
+        # Key match breakdown
+        matched = summary.rows_identical + summary.rows_in_both_with_differences
+        parts = [f"matched: {matched:,}"]
+        if summary.rows_only_in_a > 0:
+            parts.append(f"only in A: {summary.rows_only_in_a:,}")
+        if summary.rows_only_in_b > 0:
+            parts.append(f"only in B: {summary.rows_only_in_b:,}")
 
         if summary.has_tolerance and summary.total_differences_pretolerance is not None:
             filtered = summary.total_differences_pretolerance - summary.total_differences
-            row_line += (
-                f" | diffs: {summary.total_differences_pretolerance:,} (filtered {filtered:,})"
+            parts.append(
+                f"value diffs: {summary.total_differences_pretolerance:,} "
+                f"(filtered {filtered:,})"
             )
         else:
-            row_line += f" | diffs: {summary.total_differences:,}"
+            parts.append(f"value diffs: {summary.rows_in_both_with_differences:,}")
 
-        lines.append(row_line)
+        lines.append(" | ".join(parts))
         lines.append("")
 
         # -- identical columns ------------------------------------------------
