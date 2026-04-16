@@ -867,9 +867,10 @@ def _generate_summary_pipeline(
         (c.name, c.bq_type) for c in builder.excluded_columns
     ]
 
-    # Identical rows = min(total_a, total_b) - rows_in_both_with_differences
+    # rows_in_both = total_a - only_in_a (keys present in both tables)
+    # rows_identical = rows_in_both - rows_in_both_with_differences
     rows_identical = (
-        min(result.total_rows_a, result.total_rows_b) - result.rows_in_both_with_differences
+        result.total_rows_a - result.rows_only_in_a - result.rows_in_both_with_differences
     )
 
     # Determine pre-tolerance counts using Layer 1 data
@@ -886,9 +887,8 @@ def _generate_summary_pipeline(
         rows_only_in_a_pretolerance = result.rows_only_in_a
         rows_only_in_b_pretolerance = result.rows_only_in_b
         rows_in_both_pretolerance = result.rows_in_both_with_differences
-        rows_identical_pretolerance = (
-            min(result.total_rows_a, result.total_rows_b) - rows_in_both_pretolerance
-        )
+        rows_in_both = result.total_rows_a - result.rows_only_in_a
+        rows_identical_pretolerance = rows_in_both - rows_in_both_pretolerance
 
         # Post-tolerance: rows still differing after tolerance is applied
         post_tol_diff = result.post_tolerance_diff_count
@@ -898,7 +898,7 @@ def _generate_summary_pipeline(
             # No tolerance columns actually found in Layer 3
             rows_in_both_post = rows_in_both_pretolerance
 
-        rows_identical_post = min(result.total_rows_a, result.total_rows_b) - rows_in_both_post
+        rows_identical_post = rows_in_both - rows_in_both_post
 
         return ComparisonSummary(
             table_a=builder.table_a,
@@ -1024,8 +1024,8 @@ def _generate_summary_legacy(
     rows_only_in_b = result.rows_only_in_b
     rows_in_both_with_differences = result.rows_in_both_with_differences
 
-    # Calculate identical rows
-    rows_identical = min(total_rows_a, total_rows_b) - rows_in_both_with_differences
+    # Calculate identical rows: rows_in_both - rows_in_both_with_differences
+    rows_identical = total_rows_a - rows_only_in_a - rows_in_both_with_differences
 
     # Also build unfiltered query for pre-tolerance counts
     unfiltered_diff_query = None
@@ -1055,7 +1055,7 @@ def _generate_summary_legacy(
             pretolerance_result.rows_in_both_with_differences
         )
         rows_identical_pretolerance = (
-            min(total_rows_a, total_rows_b) - rows_in_both_with_differences_pretolerance
+            total_rows_a - rows_only_in_a_pretolerance - rows_in_both_with_differences_pretolerance
         )
 
     # Get column statistics
