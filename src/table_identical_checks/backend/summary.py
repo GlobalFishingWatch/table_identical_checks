@@ -49,6 +49,7 @@ _TYPE_ABBREV: dict[ColumnType, str] = {
     ColumnType.INTEGER: "INT",
     ColumnType.BOOLEAN: "BOOL",
     ColumnType.TIMESTAMP: "TS",
+    ColumnType.DATE: "DATE",
     ColumnType.STRING: "STR",
     ColumnType.GEOGRAPHY: "GEO",
 }
@@ -1083,6 +1084,7 @@ def _generate_summary_legacy(
             ColumnType.FLOAT,
             ColumnType.BOOLEAN,
             ColumnType.TIMESTAMP,
+            ColumnType.DATE,
         ):
             has_tolerance = (
                 col.column_type == ColumnType.FLOAT
@@ -1382,6 +1384,7 @@ def generate_dimension_summary(
             ColumnType.FLOAT,
             ColumnType.BOOLEAN,
             ColumnType.TIMESTAMP,
+            ColumnType.DATE,
         ):
             delta_selects = f"""
                 MAX({delta_column}__abs_delta) AS max_abs_delta,

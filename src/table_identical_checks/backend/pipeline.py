@@ -122,6 +122,7 @@ def _parse_pipeline_result(row: bigquery.Row, builder: QueryBuilder) -> Pipeline
             ColumnType.FLOAT,
             ColumnType.BOOLEAN,
             ColumnType.TIMESTAMP,
+            ColumnType.DATE,
         ):
             max_abs = row_dict.get(_alias(col.name, "max_abs_delta"))
             if max_abs is not None:

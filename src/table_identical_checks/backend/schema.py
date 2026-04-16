@@ -16,6 +16,7 @@ class ColumnType(Enum):
     FLOAT = "float"
     STRING = "string"
     TIMESTAMP = "timestamp"
+    DATE = "date"
     BOOLEAN = "boolean"
     GEOGRAPHY = "geography"
     UNSUPPORTED = "unsupported"
@@ -32,7 +33,7 @@ BQ_TYPE_MAP: dict[str, ColumnType] = {
     "STRING": ColumnType.STRING,
     "TIMESTAMP": ColumnType.TIMESTAMP,
     "DATETIME": ColumnType.TIMESTAMP,
-    "DATE": ColumnType.TIMESTAMP,
+    "DATE": ColumnType.DATE,
     "BOOLEAN": ColumnType.BOOLEAN,
     "BOOL": ColumnType.BOOLEAN,
     "GEOGRAPHY": ColumnType.GEOGRAPHY,

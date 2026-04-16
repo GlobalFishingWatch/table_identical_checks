@@ -236,6 +236,28 @@ class QueryBuilder:
                     ]
                 )
 
+            elif col.column_type == ColumnType.DATE:
+                # Date columns: use DATE_DIFF for delta in days
+                select_cols.extend(
+                    [
+                        col_a.label(f"a__{col.name}"),
+                        col_b.label(f"b__{col.name}"),
+                        literal_column(
+                            f"DATE_DIFF({self.alias_a}.{col.name}, "
+                            f"{self.alias_b}.{col.name}, DAY)"
+                        ).label(f"{col.name}__delta"),
+                        literal_column(
+                            f"ABS(DATE_DIFF({self.alias_a}.{col.name}, "
+                            f"{self.alias_b}.{col.name}, DAY))"
+                        ).label(f"{col.name}__abs_delta"),
+                        literal_column(
+                            f"SAFE_DIVIDE(DATE_DIFF({self.alias_a}.{col.name}, "
+                            f"{self.alias_b}.{col.name}, DAY), "
+                            f"UNIX_DATE({self.alias_b}.{col.name}))"
+                        ).label(f"{col.name}__rel_delta"),
+                    ]
+                )
+
             elif col.column_type == ColumnType.STRING:
                 # String columns: include both values and match flag
                 select_cols.extend(
@@ -867,6 +889,18 @@ class QueryBuilder:
                     ]
                 )
 
+            elif col.column_type == ColumnType.DATE:
+                sa = self._safe_alias
+                dd = f"DATE_DIFF({a}, {b}, DAY)"
+                l2_select_parts.extend(
+                    [
+                        f"  {dd} AS {sa(f'{col.name}__delta')}",
+                        f"  ABS({dd}) AS {sa(f'{col.name}__abs_delta')}",
+                        f"  SAFE_DIVIDE({dd}, UNIX_DATE({b}))"
+                        f" AS {sa(f'{col.name}__rel_delta')}",
+                    ]
+                )
+
             elif col.column_type == ColumnType.STRING:
                 l2_select_parts.append(
                     f"  NOT {self._l1_null_safe_eq(col.name)}"
@@ -934,6 +968,7 @@ class QueryBuilder:
                 ColumnType.FLOAT,
                 ColumnType.BOOLEAN,
                 ColumnType.TIMESTAMP,
+                ColumnType.DATE,
             )
             if col.column_type in numeric_types:
                 sa = self._safe_alias
