@@ -425,10 +425,10 @@ class TableFormatter:
         if summary.rows_only_in_b > 0:
             parts.append(f"only in B: {summary.rows_only_in_b:,}")
 
-        if summary.has_tolerance and summary.total_differences_pretolerance is not None:
-            filtered = summary.total_differences_pretolerance - summary.total_differences
+        if summary.has_tolerance and summary.rows_in_both_with_differences_pretolerance is not None:
+            filtered = summary.rows_in_both_with_differences_pretolerance - summary.rows_in_both_with_differences
             parts.append(
-                f"value diffs: {summary.total_differences_pretolerance:,} "
+                f"value diffs: {summary.rows_in_both_with_differences_pretolerance:,} "
                 f"(filtered {filtered:,})"
             )
         else:
@@ -480,8 +480,8 @@ class TableFormatter:
         rows: list[_ColumnRow] = []
         has_tol = summary.has_tolerance
         cdc = summary.column_diff_counts
-        # total_rows for diff%: use min of both tables (rows that can be matched)
-        total_rows = min(summary.total_rows_a, summary.total_rows_b) if cdc else None
+        # total_rows for diff%: rows present in both tables (matched on keys)
+        total_rows = (summary.total_rows_a - summary.rows_only_in_a) if cdc else None
 
         # Numeric columns
         for col_name, stats in summary.numeric_column_stats.items():
@@ -1089,7 +1089,7 @@ def _generate_summary_legacy(
             has_tolerance = (
                 col.column_type == ColumnType.FLOAT
                 and builder.tolerance_config
-                and builder.tolerance_config.get_tolerance(col.name) is not None
+                and builder.tolerance_config.has_any_tolerance(col.name)
             )
 
             stats_query = f"""
@@ -1149,7 +1149,7 @@ def _generate_summary_legacy(
         elif col.column_type == ColumnType.GEOGRAPHY:
             has_geo_tolerance = (
                 builder.tolerance_config
-                and builder.tolerance_config.get_tolerance(col.name) is not None
+                and builder.tolerance_config.has_any_tolerance(col.name)
             )
 
             geo_stats_query = f"""

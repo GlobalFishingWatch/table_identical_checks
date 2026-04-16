@@ -391,7 +391,12 @@ class QueryBuilder:
         if self.tolerance_config:
             tolerance_exclusion = self._build_tolerance_exclusion(table_a_obj, table_b_obj)
             if tolerance_exclusion is not None:
-                return and_(base_condition, ~tolerance_exclusion)
+                first_key = self.key_columns[0]
+                in_both = and_(
+                    table_a_obj.c[first_key].isnot(None),
+                    table_b_obj.c[first_key].isnot(None),
+                )
+                return and_(base_condition, ~and_(in_both, tolerance_exclusion))
 
         return base_condition
 
@@ -705,7 +710,8 @@ class QueryBuilder:
 
         if not parts:
             return "TRUE"
-        return " OR ".join(parts) if len(parts) > 1 else parts[0]
+        inner = " OR ".join(parts) if len(parts) > 1 else parts[0]
+        return f"IF({a} IS NOT NULL AND {b} IS NOT NULL, {inner}, {a} IS NULL AND {b} IS NULL)"
 
     @staticmethod
     def _safe_alias(name: str) -> str:
