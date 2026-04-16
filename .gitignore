@@ -36,8 +36,9 @@ sa.json
 .env
 .envrc.local
 
-# Claude Code
-.claude/
+# Claude Code (track skills, ignore everything else)
+.claude/*
+!.claude/skills/
 CLAUDE.md
 
 # OS
