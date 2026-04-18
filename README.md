@@ -12,9 +12,31 @@ Compare BigQuery tables and identify differences.
 
 ## Installation
 
+For development in this repo:
 ```bash
 pip install -e ".[dev]"
 ```
+
+For global use (CLI available in PATH anywhere, tracks this repo — `git pull` updates instantly):
+```bash
+pipx install --editable /path/to/table_identical_checks
+```
+
+## Claude Code integration
+
+### `/compare` skill (available today)
+
+A user-scope Claude Code skill at `~/.claude/skills/compare/SKILL.md` wraps `table-check summary` with sensible defaults (table format, `GOOGLE_CLOUD_PROJECT=world-fishing-827`). It works in any project once the CLI is on `PATH` (see pipx install above).
+
+Usage in Claude Code:
+```
+/compare project.ds.table_a project.ds.table_b --keys=id
+/compare project.ds.table_a project.ds.table_b --keys=id,date --max-diff-pct=100
+```
+
+### MCP server (planned)
+
+A native MCP server wrapping the same CLI (`summary`, `format`, `verify-query`, and likely `diff` / `breakdown`) is on the roadmap. This would let non-Claude-Code clients call the tool through native MCP tool invocations instead of shelling out. Intentionally deferred until the CLI surface stabilises.
 
 ## Quick Start
 
