@@ -127,6 +127,25 @@ def _format_duplicate_warning(summary: "ComparisonSummary") -> list[str]:
     return lines
 
 
+def _format_aborted_warning(summary: "ComparisonSummary") -> list[str]:
+    """Return lines for a prominent circuit-breaker abort warning, or empty list."""
+    if not summary.pipeline_aborted:
+        return []
+
+    banner = "!" * 60
+    return [
+        "",
+        banner,
+        "!! PIPELINE ABORTED (circuit breaker) !!",
+        banner,
+        "  More than --max-diff-pct of rows differ; Layers 2 and 3 were skipped.",
+        "  Per-column delta stats and tolerance filtering are NOT available.",
+        "  Rerun with a higher --max-diff-pct (e.g. 100) for full stats.",
+        banner,
+        "",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Verbose formatter (the original __str__ output)
 # ---------------------------------------------------------------------------
@@ -147,6 +166,9 @@ class VerboseFormatter:
 
         # Show duplicate key warning prominently
         lines.extend(_format_duplicate_warning(summary))
+
+        # Show circuit-breaker abort warning prominently
+        lines.extend(_format_aborted_warning(summary))
 
         # Show excluded columns prominently near the top
         if summary.excluded_columns:
@@ -339,17 +361,21 @@ class _ColumnRow:
     outside_tolerance: int | None = None
     within_tolerance: int | None = None
     has_tolerance: bool = False
+    aborted: bool = False  # True when row was constructed from Layer 1 only (pipeline abort)
 
     @property
     def status(self) -> str:
-        """Derive OK / NOK.
+        """Derive OK / NOK / ABORT.
 
+        - Aborted rows (Layer 1 only): "ABORT" since we only know a diff exists.
         - For columns with tolerance: NOK if outside_tolerance > 0.
         - For string columns without tolerance: NOK if mismatch_count > 0.
         - For numeric columns without tolerance: NOK if any delta exists
           (the column would not appear in the table if it were identical,
           so reaching here means there are differences).
         """
+        if self.aborted:
+            return "ABORT"
         if self.has_tolerance:
             return "NOK" if (self.outside_tolerance or 0) > 0 else "OK"
         # Without tolerance: presence in the table means diffs exist.
@@ -404,6 +430,9 @@ class TableFormatter:
         # -- duplicate key warning (very prominent) --------------------------
         lines.extend(_format_duplicate_warning(summary))
 
+        # -- circuit-breaker abort warning (very prominent) ------------------
+        lines.extend(_format_aborted_warning(summary))
+
         # -- excluded columns (prominent) ------------------------------------
         if summary.excluded_columns:
             lines.append(
@@ -430,6 +459,11 @@ class TableFormatter:
             parts.append(
                 f"value diffs: {summary.rows_in_both_with_differences_pretolerance:,} "
                 f"(filtered {filtered:,})"
+            )
+        elif summary.pipeline_aborted:
+            parts.append(
+                f"value diffs: {summary.rows_in_both_with_differences:,} "
+                f"(pre-tolerance; aborted)"
             )
         else:
             parts.append(f"value diffs: {summary.rows_in_both_with_differences:,}")
@@ -469,10 +503,17 @@ class TableFormatter:
     def _identical_columns(summary: "ComparisonSummary") -> list[str]:
         """Return column names that are completely identical (zero differences)."""
         all_value_cols = set(summary.column_types.keys())
-        cols_with_diffs: set[str] = set()
-        cols_with_diffs.update(summary.numeric_column_stats.keys())
-        cols_with_diffs.update(summary.string_column_mismatches.keys())
-        cols_with_diffs.update(summary.geography_column_stats.keys())
+        if summary.pipeline_aborted and summary.column_diff_counts:
+            # Layer 2/3 skipped, so the per-type stat dicts are empty.
+            # Fall back to Layer 1's column_diff_counts for the "identical" set.
+            cols_with_diffs = {
+                c for c, n in summary.column_diff_counts.items() if n > 0
+            }
+        else:
+            cols_with_diffs = set()
+            cols_with_diffs.update(summary.numeric_column_stats.keys())
+            cols_with_diffs.update(summary.string_column_mismatches.keys())
+            cols_with_diffs.update(summary.geography_column_stats.keys())
         return sorted(all_value_cols - cols_with_diffs)
 
     def _build_column_rows(self, summary: "ComparisonSummary") -> list[_ColumnRow]:
@@ -482,6 +523,23 @@ class TableFormatter:
         cdc = summary.column_diff_counts
         # total_rows for diff%: rows present in both tables (matched on keys)
         total_rows = (summary.total_rows_a - summary.rows_only_in_a) if cdc else None
+
+        # Aborted pipeline: Layer 2/3 skipped, so only column_diff_counts is
+        # available. Build one row per differing column with stats as dashes.
+        if summary.pipeline_aborted:
+            rows.extend(
+                _ColumnRow(
+                    name=col_name,
+                    col_type=summary.column_types.get(col_name, ColumnType.FLOAT),
+                    diff_count=count,
+                    total_rows=total_rows,
+                    aborted=True,
+                )
+                for col_name, count in cdc.items()
+                if count > 0
+            )
+            rows.sort(key=lambda r: r.name)
+            return rows
 
         # Numeric columns
         for col_name, stats in summary.numeric_column_stats.items():
@@ -723,6 +781,10 @@ class ComparisonSummary:
     partition_filter_a: str | None = None
     partition_filter_b: str | None = None
 
+    # True when the pipeline's circuit breaker aborted execution after Layer 1,
+    # meaning per-column stats (numeric/string/geography) were NOT computed.
+    pipeline_aborted: bool = False
+
     # Column sorting order
     column_sort_order: str = "alphabetical"  # "alphabetical" or "significance"
 
@@ -928,6 +990,7 @@ def _generate_summary_pipeline(
             rows_only_in_b_pretolerance=rows_only_in_b_pretolerance,
             rows_in_both_with_differences_pretolerance=rows_in_both_pretolerance,
             rows_identical_pretolerance=rows_identical_pretolerance,
+            pipeline_aborted=(result.pipeline_status == "ABORTED"),
             column_sort_order=column_sort_order,
             output_format=output_format,
         )
@@ -951,6 +1014,7 @@ def _generate_summary_pipeline(
         column_types=column_types,
         tolerance_config=tolerance_config_display,
         rel_tolerance_config=rel_tolerance_config_display,
+        pipeline_aborted=(result.pipeline_status == "ABORTED"),
         column_sort_order=column_sort_order,
         output_format=output_format,
     )

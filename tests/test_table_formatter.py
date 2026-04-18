@@ -12,7 +12,9 @@ from table_identical_checks.backend.summary import (
     _fmt_count,
     _fmt_number,
     _truncate,
+    from_json_dict,
     get_formatter,
+    to_json_dict,
 )
 
 # ---------------------------------------------------------------------------
@@ -25,6 +27,7 @@ def _make_summary(
     numeric_column_stats: dict[str, dict] | None = None,
     string_column_mismatches: dict[str, int] | None = None,
     column_types: dict[str, ColumnType] | None = None,
+    column_diff_counts: dict[str, int] | None = None,
     tolerance_config: dict[str, float] | None = None,
     rows_only_in_a: int = 0,
     rows_only_in_b: int = 0,
@@ -40,6 +43,7 @@ def _make_summary(
     output_format: str = "table",
     duplicate_info_a: DuplicateInfo | None = None,
     duplicate_info_b: DuplicateInfo | None = None,
+    pipeline_aborted: bool = False,
 ) -> ComparisonSummary:
     return ComparisonSummary(
         table_a="proj.ds.table_a",
@@ -54,6 +58,7 @@ def _make_summary(
         numeric_column_stats=numeric_column_stats or {},
         string_column_mismatches=string_column_mismatches or {},
         column_types=column_types or {},
+        column_diff_counts=column_diff_counts or {},
         tolerance_config=tolerance_config,
         rows_only_in_a_pretolerance=rows_only_in_a_pretolerance,
         rows_only_in_b_pretolerance=rows_only_in_b_pretolerance,
@@ -63,6 +68,7 @@ def _make_summary(
         output_format=output_format,
         duplicate_info_a=duplicate_info_a,
         duplicate_info_b=duplicate_info_b,
+        pipeline_aborted=pipeline_aborted,
     )
 
 
@@ -1027,3 +1033,135 @@ class TestDuplicateInfo:
     def test_has_duplicates_false(self):
         info = DuplicateInfo(0, 0, 0)
         assert info.has_duplicates is False
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-aborted handling
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineAborted:
+    """Tests for the circuit-breaker (ABORTED pipeline) display path."""
+
+    def test_identical_columns_when_aborted(self):
+        """When aborted, identical set derives from column_diff_counts (Layer 1)."""
+        s = _make_summary(
+            pipeline_aborted=True,
+            numeric_column_stats={},
+            string_column_mismatches={},
+            column_diff_counts={"col_a": 10, "col_b": 0, "col_c": 5},
+            column_types={
+                "col_a": ColumnType.FLOAT,
+                "col_b": ColumnType.FLOAT,
+                "col_c": ColumnType.FLOAT,
+                "col_d": ColumnType.FLOAT,  # not in diff counts -> also identical
+            },
+        )
+        result = TableFormatter._identical_columns(s)
+        assert result == ["col_b", "col_d"]
+
+    def test_aborted_warning_appears_in_table(self):
+        s = _make_summary(
+            pipeline_aborted=True,
+            column_diff_counts={"col_a": 10},
+            column_types={"col_a": ColumnType.FLOAT},
+        )
+        output = str(s)
+        assert "PIPELINE ABORTED" in output
+
+    def test_aborted_warning_appears_in_verbose(self):
+        s = _make_summary(
+            pipeline_aborted=True,
+            column_diff_counts={"col_a": 10},
+            column_types={"col_a": ColumnType.FLOAT},
+            output_format="verbose",
+        )
+        output = str(s)
+        assert "PIPELINE ABORTED" in output
+
+    def test_column_rows_from_diff_counts_when_aborted(self):
+        """An aborted summary renders one data row per col with diff_count > 0."""
+        s = _make_summary(
+            pipeline_aborted=True,
+            column_diff_counts={"col_a": 100, "col_b": 0, "col_c": 50},
+            column_types={
+                "col_a": ColumnType.FLOAT,
+                "col_b": ColumnType.FLOAT,
+                "col_c": ColumnType.STRING,
+            },
+        )
+        output = str(s)
+        # Count data lines that contain the type abbreviations
+        data_lines = [
+            line for line in output.split("\n")
+            if ("col_a" in line and "FLT" in line)
+            or ("col_c" in line and "STR" in line)
+        ]
+        # col_a and col_c rendered; col_b (diff_count=0) must not
+        assert len(data_lines) == 2
+        # col_b should not appear as a data row
+        assert not any("col_b" in line and ("FLT" in line or "STR" in line) for line in output.split("\n"))
+        # Status should be ABORT
+        assert "ABORT" in output
+
+    def test_value_diffs_annotation_when_aborted(self):
+        s = _make_summary(
+            pipeline_aborted=True,
+            column_diff_counts={"col_a": 500},
+            column_types={"col_a": ColumnType.FLOAT},
+            rows_in_both_with_differences=500,
+        )
+        output = str(s)
+        assert "value diffs: 500 (pre-tolerance; aborted)" in output
+
+    def test_non_aborted_behavior_unchanged(self):
+        """When pipeline_aborted=False, stat-dict-driven identical detection stays."""
+        s = _make_summary(
+            pipeline_aborted=False,
+            numeric_column_stats={"col_a": {"max_abs_delta": 0.01}},
+            column_diff_counts={"col_a": 10, "col_b": 5},  # col_b has diffs but no stats
+            column_types={
+                "col_a": ColumnType.FLOAT,
+                "col_b": ColumnType.FLOAT,
+            },
+        )
+        # col_b has no stats -> treated as identical in the non-aborted path
+        result = TableFormatter._identical_columns(s)
+        assert result == ["col_b"]
+
+    def test_non_aborted_value_diffs_no_annotation(self):
+        """Without abort, the 'value diffs' line has no aborted annotation."""
+        s = _make_summary(
+            pipeline_aborted=False,
+            numeric_column_stats={"col_a": {"max_abs_delta": 0.01}},
+            column_types={"col_a": ColumnType.FLOAT},
+            rows_in_both_with_differences=42,
+        )
+        output = str(s)
+        assert "pre-tolerance; aborted" not in output
+
+
+# ---------------------------------------------------------------------------
+# JSON round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestJsonRoundtrip:
+    """Tests for to_json_dict / from_json_dict preservation."""
+
+    def test_json_roundtrip_preserves_pipeline_aborted(self):
+        s = _make_summary(
+            pipeline_aborted=True,
+            column_diff_counts={"col_a": 10},
+            column_types={"col_a": ColumnType.FLOAT},
+        )
+        restored = from_json_dict(to_json_dict(s))
+        assert restored.pipeline_aborted is True
+        assert restored.column_diff_counts == {"col_a": 10}
+
+    def test_json_roundtrip_default_pipeline_aborted_false(self):
+        s = _make_summary(
+            column_types={"col_a": ColumnType.FLOAT},
+        )
+        restored = from_json_dict(to_json_dict(s))
+        assert restored.pipeline_aborted is False
