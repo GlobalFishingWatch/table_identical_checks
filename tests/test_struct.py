@@ -145,8 +145,8 @@ class TestFlattenFields:
         names = [c.name for c in columns]
         assert names == ["outer.tag", "outer.inner.x", "outer.inner.y"]
 
-    def test_repeated_struct_marked_unsupported(self):
-        """REPEATED STRUCT should NOT be flattened; marked UNSUPPORTED."""
+    def test_repeated_struct_of_scalars_marked_array(self):
+        """REPEATED STRUCT of scalars should NOT be flattened; marked ARRAY."""
         fields = [
             bigquery.SchemaField(
                 "tags",
@@ -161,10 +161,11 @@ class TestFlattenFields:
         columns = _flatten_fields(fields)
         assert len(columns) == 1
         assert columns[0].name == "tags"
-        assert columns[0].column_type == ColumnType.UNSUPPORTED
+        assert columns[0].column_type == ColumnType.ARRAY
+        assert columns[0].bq_type == "ARRAY<STRUCT<key STRING, value STRING>>"
 
-    def test_repeated_field_inside_struct_marked_unsupported(self):
-        """A REPEATED sub-field inside a non-repeated STRUCT should be UNSUPPORTED."""
+    def test_repeated_scalar_field_inside_struct_marked_array(self):
+        """A REPEATED scalar sub-field inside a non-repeated STRUCT should be ARRAY."""
         fields = [
             bigquery.SchemaField(
                 "data",
@@ -180,7 +181,8 @@ class TestFlattenFields:
         assert "data.name" in names
         assert "data.values" in names
         values_col = next(c for c in columns if c.name == "data.values")
-        assert values_col.column_type == ColumnType.UNSUPPORTED
+        assert values_col.column_type == ColumnType.ARRAY
+        assert values_col.bq_type == "ARRAY<INT64>"
 
     def test_nullable_struct_sub_fields(self):
         """Sub-fields of a NULLABLE struct should be nullable."""

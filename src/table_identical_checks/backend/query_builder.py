@@ -268,6 +268,28 @@ class QueryBuilder:
                     ]
                 )
 
+            elif col.column_type == ColumnType.ARRAY:
+                # Array columns: canonical JSON for byte-compare (multiset semantics),
+                # signed length delta, and explicit mismatch flag.
+                a_ref = f"{self.alias_a}.{col.name}"
+                b_ref = f"{self.alias_b}.{col.name}"
+                canon_a = self._array_canonical_sql(a_ref)
+                canon_b = self._array_canonical_sql(b_ref)
+                select_cols.extend(
+                    [
+                        literal_column(canon_a).label(f"a__{col.name}"),
+                        literal_column(canon_b).label(f"b__{col.name}"),
+                        literal_column(
+                            f"ARRAY_LENGTH({a_ref}) - ARRAY_LENGTH({b_ref})"
+                        ).label(f"{col.name}__len_delta"),
+                        literal_column(
+                            f"NOT (({a_ref} IS NULL AND {b_ref} IS NULL) OR "
+                            f"({a_ref} IS NOT NULL AND {b_ref} IS NOT NULL "
+                            f"AND {canon_a} = {canon_b}))"
+                        ).label(f"{col.name}__mismatch"),
+                    ]
+                )
+
             elif col.column_type == ColumnType.GEOGRAPHY:
                 # Geography columns: ST_ASTEXT for values, ST_DISTANCE for delta (meters)
                 select_cols.extend(
@@ -342,6 +364,31 @@ class QueryBuilder:
             f"({a} IS NOT NULL AND {b} IS NOT NULL AND ST_EQUALS({a}, {b})))"
         )
 
+    def _null_safe_array_equal(self, col_name):
+        """NULL-safe multiset equality for ARRAY columns in the SQLAlchemy path."""
+        a = f"{self.alias_a}.{col_name}"
+        b = f"{self.alias_b}.{col_name}"
+        canon_a = self._array_canonical_sql(a)
+        canon_b = self._array_canonical_sql(b)
+        return literal_column(
+            f"(({a} IS NULL AND {b} IS NULL) OR "
+            f"({a} IS NOT NULL AND {b} IS NOT NULL "
+            f"AND {canon_a} = {canon_b}))"
+        )
+
+    def _null_safe_array_not_equal(self, col_name):
+        """NULL-safe multiset inequality for ARRAY columns in the SQLAlchemy path."""
+        a = f"{self.alias_a}.{col_name}"
+        b = f"{self.alias_b}.{col_name}"
+        canon_a = self._array_canonical_sql(a)
+        canon_b = self._array_canonical_sql(b)
+        return literal_column(
+            f"(({a} IS NOT NULL AND {b} IS NULL) OR "
+            f"({a} IS NULL AND {b} IS NOT NULL) OR "
+            f"({a} IS NOT NULL AND {b} IS NOT NULL "
+            f"AND {canon_a} != {canon_b}))"
+        )
+
     def _build_where_clause(
         self, table_a_obj, table_b_obj, columns_filter: list[str] | None = None
     ):
@@ -375,6 +422,8 @@ class QueryBuilder:
         for col in value_cols:
             if col.column_type == ColumnType.GEOGRAPHY:
                 conditions.append(self._null_safe_geography_not_equal(col.name))
+            elif col.column_type == ColumnType.ARRAY:
+                conditions.append(self._null_safe_array_not_equal(col.name))
             else:
                 col_a = table_a_obj.c[col.name]
                 col_b = table_b_obj.c[col.name]
@@ -437,9 +486,14 @@ class QueryBuilder:
 
         exclusion_conditions = []
 
-        # Condition 1: All non-float/non-geography columns must be equal
+        # Condition 1: All non-float/non-geography columns must be equal.
+        # ARRAY columns use multiset-equality (no tolerance support by design).
         for col in self._value_columns():
-            if col.column_type not in (ColumnType.FLOAT, ColumnType.GEOGRAPHY):
+            if col.column_type in (ColumnType.FLOAT, ColumnType.GEOGRAPHY):
+                continue
+            if col.column_type == ColumnType.ARRAY:
+                exclusion_conditions.append(self._null_safe_array_equal(col.name))
+            else:
                 col_a = table_a_obj.c[col.name]
                 col_b = table_b_obj.c[col.name]
                 exclusion_conditions.append(self._null_safe_equal(col_a, col_b))
@@ -595,6 +649,8 @@ class QueryBuilder:
         for col in value_cols:
             if col.column_type == ColumnType.GEOGRAPHY:
                 conditions.append(self._null_safe_geography_not_equal(col.name))
+            elif col.column_type == ColumnType.ARRAY:
+                conditions.append(self._null_safe_array_not_equal(col.name))
             else:
                 col_a = table_a_obj.c[col.name]
                 col_b = table_b_obj.c[col.name]
@@ -684,6 +740,36 @@ class QueryBuilder:
         return (
             f"(({a} IS NULL AND {b} IS NULL) "
             f"OR ({a} IS NOT NULL AND {b} IS NOT NULL AND ST_EQUALS({a}, {b})))"
+        )
+
+    @staticmethod
+    def _array_canonical_sql(ref: str) -> str:
+        """Canonicalise an array for byte-level multiset equality.
+
+        Sorts elements by their JSON representation and emits a deterministic JSON
+        string. Two arrays with the same multiset of elements collapse to identical
+        byte sequences regardless of the original ordering.
+        """
+        return (
+            f"TO_JSON_STRING(ARRAY(SELECT e FROM UNNEST({ref}) AS e "
+            f"ORDER BY TO_JSON_STRING(e)))"
+        )
+
+    def _l1_array_eq(self, col_name: str) -> str:
+        """Generate raw SQL NULL-safe multiset equality for Layer 1 array flags.
+
+        UNNEST(NULL) returns an empty set, so the canonical form of NULL would
+        otherwise collide with the canonical form of []. The explicit
+        ``a IS NULL AND b IS NULL`` branch keeps that distinction.
+        """
+        a = f"a.{col_name}"
+        b = f"b.{col_name}"
+        canon_a = self._array_canonical_sql(a)
+        canon_b = self._array_canonical_sql(b)
+        return (
+            f"(({a} IS NULL AND {b} IS NULL) "
+            f"OR ({a} IS NOT NULL AND {b} IS NOT NULL "
+            f"AND {canon_a} = {canon_b}))"
         )
 
     def _float_within_tol_sql(self, a: str, b: str, col_name: str) -> str:
@@ -787,6 +873,8 @@ class QueryBuilder:
         for col in value_cols:
             if col.column_type == ColumnType.GEOGRAPHY:
                 eq_expr = self._l1_geography_eq(col.name)
+            elif col.column_type == ColumnType.ARRAY:
+                eq_expr = self._l1_array_eq(col.name)
             else:
                 eq_expr = self._l1_null_safe_eq(col.name)
             eq_alias = self._safe_alias(f"{col.name}__eq")
@@ -799,6 +887,8 @@ class QueryBuilder:
         for col in value_cols:
             if col.column_type == ColumnType.GEOGRAPHY:
                 l1_where_parts.append(f"NOT {self._l1_geography_eq(col.name)}")
+            elif col.column_type == ColumnType.ARRAY:
+                l1_where_parts.append(f"NOT {self._l1_array_eq(col.name)}")
             else:
                 l1_where_parts.append(f"NOT {self._l1_null_safe_eq(col.name)}")
 
@@ -914,6 +1004,19 @@ class QueryBuilder:
                     f" AS {self._safe_alias(f'{col.name}__mismatch')}"
                 )
 
+            elif col.column_type == ColumnType.ARRAY:
+                sa = self._safe_alias
+                # ARRAY_LENGTH(NULL) is NULL, so the subtraction NULL-propagates
+                # naturally for rows where either array is missing.
+                l2_select_parts.extend(
+                    [
+                        f"  (ARRAY_LENGTH({a}) - ARRAY_LENGTH({b}))"
+                        f" AS {sa(f'{col.name}__len_delta')}",
+                        f"  NOT {self._l1_array_eq(col.name)}"
+                        f" AS {sa(f'{col.name}__mismatch')}",
+                    ]
+                )
+
             elif col.column_type == ColumnType.GEOGRAPHY:
                 sa = self._safe_alias
                 dist = f"IF({a} IS NOT NULL AND {b} IS NOT NULL, ST_DISTANCE({a}, {b}, TRUE), NULL)"
@@ -1007,6 +1110,19 @@ class QueryBuilder:
                 l3_stats_parts.append(
                     f"  COUNTIF({sa(f'{col.name}__mismatch')})"
                     f" AS {sa(f'{col.name}__mismatches')}"
+                )
+
+            elif col.column_type == ColumnType.ARRAY:
+                sa = self._safe_alias
+                l3_stats_parts.extend(
+                    [
+                        f"  COUNTIF({sa(f'{col.name}__mismatch')})"
+                        f" AS {sa(f'{col.name}__mismatch_count')}",
+                        f"  MAX(ABS({sa(f'{col.name}__len_delta')}))"
+                        f" AS {sa(f'{col.name}__max_abs_len_delta')}",
+                        f"  AVG(ABS({sa(f'{col.name}__len_delta')}))"
+                        f" AS {sa(f'{col.name}__avg_abs_len_delta')}",
+                    ]
                 )
 
             elif col.column_type == ColumnType.GEOGRAPHY:

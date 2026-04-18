@@ -52,6 +52,7 @@ _TYPE_ABBREV: dict[ColumnType, str] = {
     ColumnType.DATE: "DATE",
     ColumnType.STRING: "STR",
     ColumnType.GEOGRAPHY: "GEO",
+    ColumnType.ARRAY: "ARR",
 }
 
 
@@ -329,6 +330,19 @@ class VerboseFormatter:
             for col, count in summary.string_column_mismatches.items():
                 lines.append(f"  {col}: {count:,} mismatches")
 
+        if summary.array_column_stats:
+            lines.extend(
+                [
+                    "",
+                    "ARRAY COLUMN MISMATCHES",
+                    "-" * 40,
+                ]
+            )
+            for col, stats in sorted(summary.array_column_stats.items()):
+                lines.append(f"  {col}: {stats['mismatch_count']:,} mismatches")
+                lines.append(f"    max_abs_len_delta: {stats.get('max_abs_len_delta')}")
+                lines.append(f"    avg_abs_len_delta: {stats.get('avg_abs_len_delta')}")
+
         lines.extend(
             [
                 "",
@@ -514,6 +528,7 @@ class TableFormatter:
             cols_with_diffs.update(summary.numeric_column_stats.keys())
             cols_with_diffs.update(summary.string_column_mismatches.keys())
             cols_with_diffs.update(summary.geography_column_stats.keys())
+            cols_with_diffs.update(summary.array_column_stats.keys())
         return sorted(all_value_cols - cols_with_diffs)
 
     def _build_column_rows(self, summary: "ComparisonSummary") -> list[_ColumnRow]:
@@ -590,6 +605,21 @@ class TableFormatter:
                     outside_tolerance=stats.get("outside_tolerance_count"),
                     within_tolerance=stats.get("within_tolerance_count"),
                     has_tolerance=col_has_tolerance,
+                )
+            )
+
+        # Array columns: reuse max_abs / avg_abs slots for length-delta stats.
+        # Mismatch count feeds diff_count; max_rel stays None -> renders as "-".
+        for col_name, stats in summary.array_column_stats.items():
+            rows.append(
+                _ColumnRow(
+                    name=col_name,
+                    col_type=ColumnType.ARRAY,
+                    diff_count=cdc.get(col_name, stats.get("mismatch_count")),
+                    total_rows=total_rows,
+                    max_abs=stats.get("max_abs_len_delta"),
+                    avg_abs=stats.get("avg_abs_len_delta"),
+                    mismatch_count=stats.get("mismatch_count"),
                 )
             )
 
@@ -752,6 +782,11 @@ class ComparisonSummary:
         default_factory=dict
     )  # col -> {max_distance_meters, avg_distance_meters}
 
+    # Array column stats
+    array_column_stats: dict[str, dict] = field(
+        default_factory=dict
+    )  # col -> {mismatch_count, max_abs_len_delta, avg_abs_len_delta}
+
     # Columns excluded due to unsupported types
     excluded_columns: list[tuple[str, str]] = field(
         default_factory=list
@@ -825,6 +860,31 @@ class ComparisonSummary:
 # ---------------------------------------------------------------------------
 
 
+def _reject_array_tolerance(builder: QueryBuilder) -> None:
+    """Raise ValueError if tolerance is configured for any ARRAY column.
+
+    Array equality is byte-level (multiset JSON comparison); tolerance is not
+    a well-defined notion for arrays of scalars or structs in this tool.
+    """
+    tc = builder.tolerance_config
+    if tc is None:
+        return
+    array_names = {
+        c.name for c in builder.columns if c.column_type == ColumnType.ARRAY
+    }
+    offending = sorted(
+        name
+        for name in array_names
+        if name in tc.column_tolerances or name in tc.column_rel_tolerances
+    )
+    if offending:
+        col = offending[0]
+        raise ValueError(
+            f"tolerance on array column '{col}' is not supported; "
+            f"array equality is byte-level (multiset JSON comparison)"
+        )
+
+
 def check_duplicates(
     client: bigquery.Client,
     builder: QueryBuilder,
@@ -872,6 +932,8 @@ def generate_summary(
     Returns:
         ComparisonSummary with all statistics
     """
+    _reject_array_tolerance(builder)
+
     # Run duplicate check first (cheap, no join)
     dup_a, dup_b = check_duplicates(client, builder)
 
@@ -981,6 +1043,7 @@ def _generate_summary_pipeline(
             numeric_column_stats=result.numeric_column_stats or {},
             string_column_mismatches=result.string_column_mismatches or {},
             geography_column_stats=result.geography_column_stats or {},
+            array_column_stats=result.array_column_stats or {},
             excluded_columns=excluded_columns,
             column_diff_counts=result.column_diff_counts,
             column_types=column_types,

@@ -11,8 +11,9 @@ from table_identical_checks.backend.summary import ComparisonSummary
 class TestUnsupportedTypeMapping:
     """Test that unsupported BQ types map to ColumnType.UNSUPPORTED."""
 
-    def test_array_is_unsupported(self):
-        assert BQ_TYPE_MAP["ARRAY"] == ColumnType.UNSUPPORTED
+    def test_array_not_in_type_map(self):
+        """ARRAY is handled via field.mode == REPEATED, not through BQ_TYPE_MAP."""
+        assert "ARRAY" not in BQ_TYPE_MAP
 
     def test_struct_not_in_type_map(self):
         """STRUCT is handled by schema flattening, not mapped directly."""

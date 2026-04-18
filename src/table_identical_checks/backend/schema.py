@@ -19,10 +19,13 @@ class ColumnType(Enum):
     DATE = "date"
     BOOLEAN = "boolean"
     GEOGRAPHY = "geography"
+    ARRAY = "array"
     UNSUPPORTED = "unsupported"
 
 
-# Mapping from BigQuery types to our column types
+# Mapping from BigQuery types to our column types.
+# ARRAY is not listed here: repetition is expressed through field.mode == "REPEATED",
+# not through a distinct field_type keyword. Array detection happens in _flatten_fields.
 BQ_TYPE_MAP: dict[str, ColumnType] = {
     "INT64": ColumnType.INTEGER,
     "INTEGER": ColumnType.INTEGER,
@@ -38,11 +41,30 @@ BQ_TYPE_MAP: dict[str, ColumnType] = {
     "BOOL": ColumnType.BOOLEAN,
     "GEOGRAPHY": ColumnType.GEOGRAPHY,
     # Unsupported complex types (STRUCT/RECORD handled by flattening, not mapped here)
-    "ARRAY": ColumnType.UNSUPPORTED,
     "JSON": ColumnType.UNSUPPORTED,
     "BYTES": ColumnType.UNSUPPORTED,
     "RANGE": ColumnType.UNSUPPORTED,
 }
+
+
+# Scalar BQ types that are supported as ARRAY elements.
+_ARRAY_SCALAR_SUPPORTED: frozenset[str] = frozenset(
+    {
+        "INT64",
+        "INTEGER",
+        "FLOAT64",
+        "FLOAT",
+        "NUMERIC",
+        "BIGNUMERIC",
+        "STRING",
+        "TIMESTAMP",
+        "DATETIME",
+        "DATE",
+        "BOOLEAN",
+        "BOOL",
+        "GEOGRAPHY",
+    }
+)
 
 
 @dataclass
@@ -56,21 +78,71 @@ class ColumnInfo:
 
 
 
+def _render_array_bq_type(field: bigquery.SchemaField) -> str:
+    """Render a human-readable BQ type string for a REPEATED field.
+
+    Produces e.g. ``ARRAY<STRING>`` or ``ARRAY<STRUCT<value STRING, count INT64>>``.
+    """
+    if field.field_type in ("STRUCT", "RECORD"):
+        children = ", ".join(f"{f.name} {f.field_type}" for f in field.fields)
+        return f"ARRAY<STRUCT<{children}>>"
+    return f"ARRAY<{field.field_type}>"
+
+
+def _classify_array_field(field: bigquery.SchemaField) -> ColumnType:
+    """Classify a REPEATED field as ARRAY or UNSUPPORTED.
+
+    Supported:
+      - ARRAY<scalar> where scalar is a groupable, non-complex type.
+      - ARRAY<STRUCT<scalars...>> where every child is scalar (no nested RECORD,
+        no REPEATED grandchild, no unsupported scalar type like BYTES/JSON).
+    Everything else (nested arrays, structs with structs/arrays inside, arrays of
+    BYTES/JSON/RANGE) is marked UNSUPPORTED.
+    """
+    if field.field_type in ("STRUCT", "RECORD"):
+        for child in field.fields:
+            if child.mode == "REPEATED":
+                return ColumnType.UNSUPPORTED
+            if child.field_type in ("STRUCT", "RECORD"):
+                return ColumnType.UNSUPPORTED
+            if child.field_type not in _ARRAY_SCALAR_SUPPORTED:
+                return ColumnType.UNSUPPORTED
+        return ColumnType.ARRAY
+
+    if field.field_type in _ARRAY_SCALAR_SUPPORTED:
+        return ColumnType.ARRAY
+    return ColumnType.UNSUPPORTED
+
+
 def _flatten_fields(
     fields: Sequence[bigquery.SchemaField],
     prefix: str = "",
 ) -> list[ColumnInfo]:
-    """Recursively flatten non-repeated STRUCT/RECORD fields into dot-notation columns."""
+    """Recursively flatten non-repeated STRUCT/RECORD fields into dot-notation columns.
+
+    REPEATED fields (ARRAYs) are NOT flattened: each array column stays as a single
+    ColumnInfo with ColumnType.ARRAY (or UNSUPPORTED for nested arrays / non-scalar
+    element structs).
+    """
     result: list[ColumnInfo] = []
     for field in fields:
         name = f"{prefix}.{field.name}" if prefix else field.name
 
-        if field.field_type in ("STRUCT", "RECORD") and field.mode != "REPEATED":
+        if field.mode == "REPEATED":
+            result.append(
+                ColumnInfo(
+                    name=name,
+                    bq_type=_render_array_bq_type(field),
+                    column_type=_classify_array_field(field),
+                    is_nullable=True,
+                )
+            )
+            continue
+
+        if field.field_type in ("STRUCT", "RECORD"):
             result.extend(_flatten_fields(field.fields, prefix=name))
         else:
             column_type = BQ_TYPE_MAP.get(field.field_type, ColumnType.UNSUPPORTED)
-            if field.mode == "REPEATED":
-                column_type = ColumnType.UNSUPPORTED
             result.append(
                 ColumnInfo(
                     name=name,

@@ -36,6 +36,7 @@ class PipelineResult:
         numeric_column_stats: Per-column aggregate stats for numeric cols (None if aborted).
         string_column_mismatches: Per-column mismatch count for string cols (None if aborted).
         geography_column_stats: Per-column distance stats for geography cols (None if aborted).
+        array_column_stats: Per-column array stats (mismatch count, len delta). None if aborted.
         post_tolerance_diff_count: Rows where NOT all toleranced cols are within
             tol (None if aborted or no tolerance).
         total_differing_rows: Count of rows in _l2 (rows in both with diffs). None if aborted.
@@ -51,6 +52,7 @@ class PipelineResult:
     numeric_column_stats: dict[str, dict] | None = None
     string_column_mismatches: dict[str, int] | None = None
     geography_column_stats: dict[str, dict] | None = None
+    array_column_stats: dict[str, dict] | None = None
     post_tolerance_diff_count: int | None = None
     total_differing_rows: int | None = None
 
@@ -112,6 +114,7 @@ def _parse_pipeline_result(row: bigquery.Row, builder: QueryBuilder) -> Pipeline
     numeric_stats: dict[str, dict] = {}
     string_mismatches: dict[str, int] = {}
     geography_stats: dict[str, dict] = {}
+    array_stats: dict[str, dict] = {}
 
     for col in value_cols:
         # Skip columns that Layer 1 identified as fully identical
@@ -163,9 +166,19 @@ def _parse_pipeline_result(row: bigquery.Row, builder: QueryBuilder) -> Pipeline
                     )
                 geography_stats[col.name] = geo_stats
 
+        elif col.column_type == ColumnType.ARRAY:
+            mismatch_count = row_dict.get(_alias(col.name, "mismatch_count"))
+            if mismatch_count is not None and mismatch_count > 0:
+                array_stats[col.name] = {
+                    "mismatch_count": mismatch_count,
+                    "max_abs_len_delta": row_dict.get(_alias(col.name, "max_abs_len_delta")),
+                    "avg_abs_len_delta": row_dict.get(_alias(col.name, "avg_abs_len_delta")),
+                }
+
     result.numeric_column_stats = numeric_stats
     result.string_column_mismatches = string_mismatches
     result.geography_column_stats = geography_stats
+    result.array_column_stats = array_stats
     result.total_differing_rows = row_dict.get("total_differing_rows")
     result.post_tolerance_diff_count = row_dict.get("post_tol_diff_count")
 
