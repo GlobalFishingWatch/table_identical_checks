@@ -15,9 +15,10 @@ class PipelineConfig:
     Attributes:
         max_diff_pct: Circuit breaker threshold as a fraction (0.1 = 10%).
                      If more than this fraction of rows differ, abort after Layer 1.
+                     Default 1.0 (100%) effectively disables the breaker.
     """
 
-    max_diff_pct: float = 0.1
+    max_diff_pct: float = 1.0
 
 
 @dataclass

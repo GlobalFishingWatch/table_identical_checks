@@ -730,7 +730,7 @@ class QueryBuilder:
         """Build COALESCE(a.key, b.key) AS key for each key column."""
         return ",\n  ".join(f"COALESCE(a.{k}, b.{k}) AS {k}" for k in self.key_columns)
 
-    def build_pipeline_script(self, max_diff_pct: float = 0.1) -> str:
+    def build_pipeline_script(self, max_diff_pct: float = 1.0) -> str:
         """Build the 3-layer multi-statement SQL script.
 
         This generates a BigQuery scripting block that:
@@ -742,6 +742,7 @@ class QueryBuilder:
 
         Args:
             max_diff_pct: Circuit breaker threshold as a fraction (0.1 = 10%).
+                         Default 1.0 (100%) effectively disables the breaker.
                          If more than this fraction of rows differ, abort after Layer 1.
 
         Returns:

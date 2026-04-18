@@ -503,9 +503,13 @@ def count(
 )
 @click.option(
     "--max-diff-pct",
-    default=10.0,
+    default=100.0,
     type=float,
-    help="Circuit breaker: abort detailed stats if more than X%% of rows differ (default: 10)",
+    help=(
+        "Circuit breaker: abort detailed stats if more than X%% of rows differ. "
+        "Default 100 effectively disables the breaker; lower it to re-enable "
+        "(e.g. --max-diff-pct=10)."
+    ),
 )
 @click.option(
     "--legacy",
