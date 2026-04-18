@@ -1,5 +1,6 @@
 """Command-line interface for table identical checks."""
 
+import json
 import os
 from datetime import datetime, timezone
 from typing import Sequence
@@ -13,9 +14,12 @@ from .backend import (
     PipelineConfig,
     QueryBuilder,
     ToleranceConfig,
+    build_verify_query,
+    from_json_dict,
     generate_dimension_summary,
     generate_summary,
     get_table_schema,
+    to_json_dict,
 )
 
 
@@ -509,6 +513,11 @@ def count(
     default=False,
     help="Use legacy multi-query path instead of pipeline",
 )
+@click.option(
+    "--output-json",
+    default=None,
+    help="Write the ComparisonSummary to a JSON file (consumable by `format` and `verify-query`)",
+)
 def summary(
     table_a: str,
     table_b: str,
@@ -522,6 +531,7 @@ def summary(
     output_format: str,
     max_diff_pct: float,
     legacy: bool,
+    output_json: str | None,
 ):
     """Generate a comprehensive comparison summary."""
     key_columns = [k.strip() for k in keys.split(",")]
@@ -567,6 +577,53 @@ def summary(
     )
     click.echo("")
     click.echo(str(result))
+
+    if output_json:
+        with open(output_json, "w") as f:
+            json.dump(to_json_dict(result), f, indent=2, default=str)
+        click.echo(f"\nSummary written to {output_json}")
+
+
+@main.command("format")
+@click.option("--input-json", required=True, help="Path to a summary JSON file")
+@click.option(
+    "--format",
+    "output_format",
+    default=None,
+    type=click.Choice(["verbose", "table"], case_sensitive=False),
+    help="Override output format (default: use value saved in JSON)",
+)
+@click.option(
+    "--sort-columns",
+    default=None,
+    type=click.Choice(["alphabetical", "significance"], case_sensitive=False),
+    help="Override column sort order",
+)
+def format_cmd(input_json: str, output_format: str | None, sort_columns: str | None):
+    """Re-render a saved ComparisonSummary from JSON without rerunning BQ queries."""
+    with open(input_json) as f:
+        data = json.load(f)
+    summary_obj = from_json_dict(data)
+    if output_format:
+        summary_obj.output_format = output_format
+    if sort_columns:
+        summary_obj.column_sort_order = sort_columns
+    click.echo(str(summary_obj))
+
+
+@main.command("verify-query")
+@click.option("--input-json", required=True, help="Path to a summary JSON file")
+def verify_query_cmd(input_json: str):
+    """Emit an EXCEPT DISTINCT / UNION ALL verification query from a saved summary.
+
+    The query includes columns that the comparison found equal (pre-tolerance)
+    and excludes columns with differences, unsupported-type columns, and
+    GEOGRAPHY columns (which are not groupable in BigQuery).
+    """
+    with open(input_json) as f:
+        data = json.load(f)
+    summary_obj = from_json_dict(data)
+    click.echo(build_verify_query(summary_obj))
 
 
 @main.command("breakdown")

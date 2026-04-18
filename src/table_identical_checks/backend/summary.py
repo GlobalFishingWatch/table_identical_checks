@@ -1,6 +1,6 @@
 """Summary statistics for table comparisons."""
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
 from google.cloud import bigquery
@@ -719,6 +719,10 @@ class ComparisonSummary:
     duplicate_info_a: DuplicateInfo | None = None
     duplicate_info_b: DuplicateInfo | None = None
 
+    # Partition filters used during comparison (captured for reproducibility)
+    partition_filter_a: str | None = None
+    partition_filter_b: str | None = None
+
     # Column sorting order
     column_sort_order: str = "alphabetical"  # "alphabetical" or "significance"
 
@@ -818,6 +822,8 @@ def generate_summary(
 
     result.duplicate_info_a = dup_a
     result.duplicate_info_b = dup_b
+    result.partition_filter_a = builder.partition_filter_a
+    result.partition_filter_b = builder.partition_filter_b
     return result
 
 
@@ -1443,4 +1449,87 @@ def generate_dimension_summary(
         total_rows_only_in_a=total_only_a,
         total_rows_only_in_b=total_only_b,
         total_rows_with_differences=total_with_diff,
+    )
+
+
+# ---------------------------------------------------------------------------
+# JSON serialization
+# ---------------------------------------------------------------------------
+
+
+def to_json_dict(summary: ComparisonSummary) -> dict:
+    """Serialize a ComparisonSummary to a JSON-friendly dict."""
+    data = asdict(summary)
+    data["column_types"] = {k: v.value for k, v in summary.column_types.items()}
+    return data
+
+
+def from_json_dict(data: dict) -> ComparisonSummary:
+    """Reconstruct a ComparisonSummary from a dict produced by to_json_dict."""
+    d = dict(data)
+    d["column_types"] = {k: ColumnType(v) for k, v in d.get("column_types", {}).items()}
+    d["excluded_columns"] = [tuple(item) for item in d.get("excluded_columns", [])]
+    if d.get("duplicate_info_a") is not None:
+        d["duplicate_info_a"] = DuplicateInfo(**d["duplicate_info_a"])
+    if d.get("duplicate_info_b") is not None:
+        d["duplicate_info_b"] = DuplicateInfo(**d["duplicate_info_b"])
+    return ComparisonSummary(**d)
+
+
+# ---------------------------------------------------------------------------
+# EXCEPT DISTINCT verification query
+# ---------------------------------------------------------------------------
+
+
+def build_verify_query(summary: ComparisonSummary) -> str:
+    """Build a SELECT * EXCEPT(...) + EXCEPT DISTINCT / UNION ALL verification SQL.
+
+    Confirms the two tables are identical after excluding:
+      * columns the pipeline skipped (unsupported types)
+      * columns with pre-tolerance differences
+      * GEOGRAPHY columns (not groupable, unusable with EXCEPT DISTINCT)
+
+    For STRUCT-flattened columns (dot-notation), excludes the top-level parent.
+    """
+    exclude: set[str] = set()
+    for col_name, _ in summary.excluded_columns:
+        exclude.add(col_name.split(".")[0])
+    for col_name, count in summary.column_diff_counts.items():
+        if count > 0:
+            exclude.add(col_name.split(".")[0])
+    for col_name, col_type in summary.column_types.items():
+        if col_type == ColumnType.GEOGRAPHY:
+            exclude.add(col_name.split(".")[0])
+
+    except_clause = f" EXCEPT({', '.join(sorted(exclude))})" if exclude else ""
+
+    def _source(table: str, partition_filter: str | None) -> str:
+        bt = f"`{table}`"
+        if partition_filter:
+            return f"(SELECT * FROM {bt} WHERE {partition_filter})"
+        return bt
+
+    a_src = _source(summary.table_a, summary.partition_filter_a)
+    b_src = _source(summary.table_b, summary.partition_filter_b)
+
+    return (
+        f"WITH a AS (\n"
+        f"  SELECT *{except_clause} FROM {a_src}\n"
+        f"),\n\n"
+        f"b AS (\n"
+        f"  SELECT *{except_clause} FROM {b_src}\n"
+        f"),\n\n"
+        f"missing_in_a AS (\n"
+        f"  SELECT * FROM b\n"
+        f"  EXCEPT DISTINCT\n"
+        f"  SELECT * FROM a\n"
+        f"),\n\n"
+        f"missing_in_b AS (\n"
+        f"  SELECT * FROM a\n"
+        f"  EXCEPT DISTINCT\n"
+        f"  SELECT * FROM b\n"
+        f")\n\n"
+        f"SELECT 'missing_in_a' AS which, * FROM missing_in_a\n"
+        f"UNION ALL\n"
+        f"SELECT 'missing_in_b' AS which, * FROM missing_in_b"
     )

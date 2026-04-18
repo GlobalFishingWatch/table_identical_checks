@@ -11,10 +11,13 @@ from .summary import (
     SummaryFormatter,
     TableFormatter,
     VerboseFormatter,
+    build_verify_query,
     check_duplicates,
+    from_json_dict,
     generate_dimension_summary,
     generate_summary,
     get_formatter,
+    to_json_dict,
 )
 from .tolerance import ToleranceConfig
 
@@ -39,4 +42,7 @@ __all__ = [
     "VerboseFormatter",
     "TableFormatter",
     "get_formatter",
+    "to_json_dict",
+    "from_json_dict",
+    "build_verify_query",
 ]
