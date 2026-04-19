@@ -131,10 +131,13 @@ not these real differences (max relative delta 2.1e-04 far exceeds 1e-12).
 | FLOAT64 | Delta metrics | Same as INT64 | Yes (absolute and/or relative) |
 | STRING | Exact (NULL-safe) | Match flag (boolean) | No |
 | TIMESTAMP | Exact (NULL-safe) | `TIMESTAMP_DIFF(a, b, MICROSECOND)` | No |
+| DATE | Exact (NULL-safe) | `DATE_DIFF(a, b, DAY)` | No |
 | BOOLEAN | Cast to INT64 | Treated as integer (0/1) | No |
 | GEOGRAPHY | `ST_EQUALS` (NULL-safe) | `ST_DISTANCE(a, b, TRUE)` in meters | Yes (`ST_DISTANCE(a, b) <= tol`) |
 | STRUCT/RECORD | Flattened to sub-fields | Per sub-field (by type) | Per sub-field |
-| ARRAY, JSON, etc. | Auto-excluded | N/A | N/A |
+| ARRAY\<scalar\>, ARRAY\<STRUCT\<scalars\>\> | Multiset equality via `TO_JSON_STRING(ARRAY(...ORDER BY TO_JSON_STRING(e)))` | Length delta, mismatch flag | No |
+| KLL_FLOAT64 / KLL_INT64 sketches (BYTES) | Opt-in via `--kll-cols` / `--kll-int-cols`; quantile-value comparison at 5 probes `[0.1, 0.25, 0.5, 0.75, 0.9]` | Max/avg abs value diff, mismatch flag | `--kll-abs-tol` (default 0.0) and `--kll-rel-tol` (default 0.05) |
+| BYTES, JSON, RANGE, nested ARRAYs | Auto-excluded | N/A | See "Comparing unsupported columns" below |
 
 ## Tolerance
 
@@ -173,6 +176,36 @@ all non-toleranced columns (boolean, string, integer, timestamp) are exactly equ
   `--tolerance=col1:0.01 --rel-tolerance=1e-6` means `col1` is within tolerance
   if `abs_delta <= 0.01` OR `rel_delta <= 1e-6`.
 
+## Comparing unsupported columns
+
+`BYTES`, `JSON`, `RANGE`, and nested / non-scalar-struct `ARRAY` columns are
+auto-excluded from `table-check summary` because these types don't have a
+universal meaningful equality notion. For these, run a separate semantic
+comparison in a hand-written query.
+
+### KLL quantile sketches (BYTES)
+
+KLL sketch byte representations depend on aggregation order and BigQuery
+parallelism, so two sketches built from the same input multiset are **not**
+required to be byte-identical. KLL provides statistical equivalence within a
+documented rank-error bound (~1.33% single-sided at the default `K=200`), not
+byte equivalence. This tool compares them semantically by extracting the
+quantile *value* at 5 fixed probes (`[0.1, 0.25, 0.5, 0.75, 0.9]`) from both
+sketches and checking absolute and relative tolerances on the extracted
+values (BigQuery does not provide a rank-from-value function for KLL
+sketches).
+
+See [`TABLE_IDENTICAL_CHECKS_QA_KLL.md`](TABLE_IDENTICAL_CHECKS_QA_KLL.md) for
+a worked example on the `segments_daily` `speed_sketch` column, including
+both comparison strategies, concrete tolerance choices, and edge cases.
+
+### Future: `--custom-eq` escape hatch
+
+A future `--custom-eq "col:<sql>"` flag (on the roadmap, not yet implemented)
+will let semantic comparisons like KLL plug directly into the standard
+`table-check summary` run so they appear in the per-column breakdown instead
+of requiring a separate query.
+
 ## Testing
 
 ```bash
@@ -199,4 +232,5 @@ pytest -m ""
 - No schema validation (assumes identical schemas)
 - Key columns must be specified manually
 - Pipeline mode only available for `summary`; other commands use the SQLAlchemy query path
-- REPEATED STRUCT/RECORD fields are not supported (auto-excluded)
+- Nested arrays and arrays containing STRUCT fields that themselves contain STRUCT/REPEATED/BYTES/JSON/RANGE are auto-excluded. `ARRAY<scalar>` and `ARRAY<STRUCT<scalars>>` are supported via multiset equality.
+- `BYTES`, `JSON`, and `RANGE` columns are auto-excluded. See "Comparing unsupported columns" above for semantic-comparison guidance (e.g. KLL sketches).

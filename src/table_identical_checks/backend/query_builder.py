@@ -40,6 +40,15 @@ class QueryBuilder:
     partition_filter_a: str | None = None
     partition_filter_b: str | None = None
     tolerance_config: ToleranceConfig | None = None
+    # KLL quantile-value tolerances, applied to the extracted value at each of
+    # the 5 probe quantiles (phi in [0.1, 0.25, 0.5, 0.75, 0.9]).
+    # Within-tolerance iff |a_q - b_q| <= kll_abs_tol
+    #                OR SAFE_DIVIDE(|a_q - b_q|, GREATEST(|a_q|, |b_q|)) <= kll_rel_tol.
+    # Default abs is 0.0 (domain-dependent; users should override when the
+    # column has a known scale). Default rel is 0.05: a loose-but-not-ridiculous
+    # ceiling on two independent K=200 sketches over smooth distributions.
+    kll_abs_tol: float = 0.0
+    kll_rel_tol: float = 0.05
 
     # Columns to exclude from comparison (only keys by default)
     _exclude_from_comparison: set[str] = field(default_factory=set)
@@ -290,6 +299,35 @@ class QueryBuilder:
                     ]
                 )
 
+            elif col.column_type in (ColumnType.KLL_FLOAT64, ColumnType.KLL_INT64):
+                # KLL sketch columns: preview p50 values (extracted at phi=0.5),
+                # compute the max absolute value diff across the 5 quantile
+                # probes, and a mismatch flag derived from the same
+                # quantile-value comparison used for equality.
+                suffix = self._kll_sql_suffix(col.column_type)
+                a_ref = f"{self.alias_a}.{col.name}"
+                b_ref = f"{self.alias_b}.{col.name}"
+                eq_expr = self._l1_kll_eq(col.name, col.column_type, a_ref, b_ref)
+                max_vd_expr = self._l2_kll_max_abs_value_diff(
+                    col.name, col.column_type, a_ref, b_ref
+                )
+                select_cols.extend(
+                    [
+                        literal_column(
+                            f"KLL_QUANTILES.EXTRACT_POINT_{suffix}({a_ref}, 0.5)"
+                        ).label(f"a__{col.name}"),
+                        literal_column(
+                            f"KLL_QUANTILES.EXTRACT_POINT_{suffix}({b_ref}, 0.5)"
+                        ).label(f"b__{col.name}"),
+                        literal_column(max_vd_expr).label(
+                            f"{col.name}__max_abs_value_diff"
+                        ),
+                        literal_column(f"NOT {eq_expr}").label(
+                            f"{col.name}__mismatch"
+                        ),
+                    ]
+                )
+
             elif col.column_type == ColumnType.GEOGRAPHY:
                 # Geography columns: ST_ASTEXT for values, ST_DISTANCE for delta (meters)
                 select_cols.extend(
@@ -424,6 +462,10 @@ class QueryBuilder:
                 conditions.append(self._null_safe_geography_not_equal(col.name))
             elif col.column_type == ColumnType.ARRAY:
                 conditions.append(self._null_safe_array_not_equal(col.name))
+            elif col.column_type in (ColumnType.KLL_FLOAT64, ColumnType.KLL_INT64):
+                conditions.append(
+                    self._null_safe_kll_not_equal(col.name, col.column_type)
+                )
             else:
                 col_a = table_a_obj.c[col.name]
                 col_b = table_b_obj.c[col.name]
@@ -488,11 +530,17 @@ class QueryBuilder:
 
         # Condition 1: All non-float/non-geography columns must be equal.
         # ARRAY columns use multiset-equality (no tolerance support by design).
+        # KLL columns use quantile-value comparison (tolerances are separate:
+        # kll_abs_tol and kll_rel_tol, applied inside _l1_kll_eq).
         for col in self._value_columns():
             if col.column_type in (ColumnType.FLOAT, ColumnType.GEOGRAPHY):
                 continue
             if col.column_type == ColumnType.ARRAY:
                 exclusion_conditions.append(self._null_safe_array_equal(col.name))
+            elif col.column_type in (ColumnType.KLL_FLOAT64, ColumnType.KLL_INT64):
+                exclusion_conditions.append(
+                    self._null_safe_kll_equal(col.name, col.column_type)
+                )
             else:
                 col_a = table_a_obj.c[col.name]
                 col_b = table_b_obj.c[col.name]
@@ -651,6 +699,10 @@ class QueryBuilder:
                 conditions.append(self._null_safe_geography_not_equal(col.name))
             elif col.column_type == ColumnType.ARRAY:
                 conditions.append(self._null_safe_array_not_equal(col.name))
+            elif col.column_type in (ColumnType.KLL_FLOAT64, ColumnType.KLL_INT64):
+                conditions.append(
+                    self._null_safe_kll_not_equal(col.name, col.column_type)
+                )
             else:
                 col_a = table_a_obj.c[col.name]
                 col_b = table_b_obj.c[col.name]
@@ -772,6 +824,116 @@ class QueryBuilder:
             f"AND {canon_a} = {canon_b}))"
         )
 
+    @staticmethod
+    def _kll_sql_suffix(column_type: ColumnType) -> str:
+        """Map a KLL ColumnType to the BQ function suffix (FLOAT64 / INT64)."""
+        if column_type == ColumnType.KLL_FLOAT64:
+            return "FLOAT64"
+        if column_type == ColumnType.KLL_INT64:
+            return "INT64"
+        raise ValueError(f"not a KLL column type: {column_type}")
+
+    # phi probe values for KLL quantile-value comparison. BQ requires the phi
+    # argument to EXTRACT_POINT_* to be a SQL literal constant, so these are
+    # unrolled inline at SQL-generation time rather than iterated via UNNEST.
+    _KLL_PHIS: tuple[float, ...] = (0.1, 0.25, 0.5, 0.75, 0.9)
+
+    def _l1_kll_eq(
+        self,
+        col_name: str,
+        column_type: ColumnType,
+        a_ref: str | None = None,
+        b_ref: str | None = None,
+    ) -> str:
+        """NULL-safe quantile-value equivalence for a pair of KLL sketch columns.
+
+        Byte-equality on KLL sketches is meaningless (the serialisation depends
+        on aggregation order and BQ parallelism). The semantic notion is
+        statistical: we extract the value at each of five fixed quantile probes
+        ``_KLL_PHIS`` from both sketches and compare those values using
+        absolute and relative tolerances:
+
+            |a_q - b_q| <= kll_abs_tol
+              OR SAFE_DIVIDE(|a_q - b_q|, GREATEST(|a_q|, |b_q|)) <= kll_rel_tol
+
+        All 5 quantile-value pairs must pass. NULL quantile pairs at any probe
+        (both NULL) count as passing; exactly one NULL fails. Both sketches
+        NULL -> equal; exactly one NULL -> not equal.
+
+        Note: BigQuery does not provide a rank-from-value function for KLL
+        sketches (``KLL_QUANTILES.RANK_*`` does not exist), so we compare values
+        at fixed probes rather than ranks at fixed anchor values.
+        """
+        suffix = self._kll_sql_suffix(column_type)
+        abs_tol = self.kll_abs_tol
+        rel_tol = self.kll_rel_tol
+        a = a_ref if a_ref is not None else f"a.{col_name}"
+        b = b_ref if b_ref is not None else f"b.{col_name}"
+
+        def _probe_eq(phi: float) -> str:
+            # BQ rejects non-literal phi, so each probe is generated as its own
+            # CASE with the phi literal inlined. Repeated EXTRACT_POINT calls
+            # are safely de-duplicated by BQ's query optimiser.
+            a_q = f"KLL_QUANTILES.EXTRACT_POINT_{suffix}({a}, {phi})"
+            b_q = f"KLL_QUANTILES.EXTRACT_POINT_{suffix}({b}, {phi})"
+            return (
+                f"(CASE "
+                f"WHEN {a_q} IS NULL AND {b_q} IS NULL THEN TRUE "
+                f"WHEN {a_q} IS NULL OR {b_q} IS NULL THEN FALSE "
+                f"WHEN ABS({a_q} - {b_q}) <= {abs_tol} "
+                f"OR SAFE_DIVIDE(ABS({a_q} - {b_q}), GREATEST(ABS({a_q}), ABS({b_q}))) <= {rel_tol} "
+                f"THEN TRUE "
+                f"ELSE FALSE "
+                f"END)"
+            )
+
+        all_probes = " AND ".join(_probe_eq(phi) for phi in self._KLL_PHIS)
+        return (
+            f"(({a} IS NULL AND {b} IS NULL) "
+            f"OR ({a} IS NOT NULL AND {b} IS NOT NULL "
+            f"AND {all_probes}))"
+        )
+
+    def _l2_kll_max_abs_value_diff(
+        self,
+        col_name: str,
+        column_type: ColumnType,
+        a_ref: str | None = None,
+        b_ref: str | None = None,
+    ) -> str:
+        """Max absolute value diff across the 5 quantile probes.
+
+        NULL when either side is NULL (keeps MAX/AVG aggregates clean).
+        Mirrors _l1_kll_eq's probe structure; returns the largest
+        ``|a_q - b_q|`` observed at the 5 probes. Probes are unrolled inline
+        because BQ requires the phi argument to be a literal constant.
+        """
+        suffix = self._kll_sql_suffix(column_type)
+        a = a_ref if a_ref is not None else f"a.{col_name}"
+        b = b_ref if b_ref is not None else f"b.{col_name}"
+        diffs = ", ".join(
+            f"ABS(KLL_QUANTILES.EXTRACT_POINT_{suffix}({a}, {phi}) - "
+            f"KLL_QUANTILES.EXTRACT_POINT_{suffix}({b}, {phi}))"
+            for phi in self._KLL_PHIS
+        )
+        return (
+            f"IF({a} IS NOT NULL AND {b} IS NOT NULL, "
+            f"GREATEST({diffs}), "
+            f"NULL)"
+        )
+
+    def _null_safe_kll_equal(self, col_name: str, column_type: ColumnType):
+        """SQLAlchemy literal_column wrapper for the KLL equality expression."""
+        a = f"{self.alias_a}.{col_name}"
+        b = f"{self.alias_b}.{col_name}"
+        return literal_column(self._l1_kll_eq(col_name, column_type, a, b))
+
+    def _null_safe_kll_not_equal(self, col_name: str, column_type: ColumnType):
+        """SQLAlchemy literal_column wrapper for the KLL inequality expression."""
+        a = f"{self.alias_a}.{col_name}"
+        b = f"{self.alias_b}.{col_name}"
+        return literal_column(f"NOT {self._l1_kll_eq(col_name, column_type, a, b)}")
+
     def _float_within_tol_sql(self, a: str, b: str, col_name: str) -> str:
         """Build a raw SQL expression for float within-tolerance check.
 
@@ -875,6 +1037,8 @@ class QueryBuilder:
                 eq_expr = self._l1_geography_eq(col.name)
             elif col.column_type == ColumnType.ARRAY:
                 eq_expr = self._l1_array_eq(col.name)
+            elif col.column_type in (ColumnType.KLL_FLOAT64, ColumnType.KLL_INT64):
+                eq_expr = self._l1_kll_eq(col.name, col.column_type)
             else:
                 eq_expr = self._l1_null_safe_eq(col.name)
             eq_alias = self._safe_alias(f"{col.name}__eq")
@@ -889,6 +1053,10 @@ class QueryBuilder:
                 l1_where_parts.append(f"NOT {self._l1_geography_eq(col.name)}")
             elif col.column_type == ColumnType.ARRAY:
                 l1_where_parts.append(f"NOT {self._l1_array_eq(col.name)}")
+            elif col.column_type in (ColumnType.KLL_FLOAT64, ColumnType.KLL_INT64):
+                l1_where_parts.append(
+                    f"NOT {self._l1_kll_eq(col.name, col.column_type)}"
+                )
             else:
                 l1_where_parts.append(f"NOT {self._l1_null_safe_eq(col.name)}")
 
@@ -1017,6 +1185,18 @@ class QueryBuilder:
                     ]
                 )
 
+            elif col.column_type in (ColumnType.KLL_FLOAT64, ColumnType.KLL_INT64):
+                sa = self._safe_alias
+                max_vd = self._l2_kll_max_abs_value_diff(col.name, col.column_type)
+                l2_select_parts.extend(
+                    [
+                        f"  {max_vd}"
+                        f" AS {sa(f'{col.name}__max_abs_value_diff')}",
+                        f"  NOT {self._l1_kll_eq(col.name, col.column_type)}"
+                        f" AS {sa(f'{col.name}__mismatch')}",
+                    ]
+                )
+
             elif col.column_type == ColumnType.GEOGRAPHY:
                 sa = self._safe_alias
                 dist = f"IF({a} IS NOT NULL AND {b} IS NOT NULL, ST_DISTANCE({a}, {b}, TRUE), NULL)"
@@ -1122,6 +1302,19 @@ class QueryBuilder:
                         f" AS {sa(f'{col.name}__max_abs_len_delta')}",
                         f"  AVG(ABS({sa(f'{col.name}__len_delta')}))"
                         f" AS {sa(f'{col.name}__avg_abs_len_delta')}",
+                    ]
+                )
+
+            elif col.column_type in (ColumnType.KLL_FLOAT64, ColumnType.KLL_INT64):
+                sa = self._safe_alias
+                l3_stats_parts.extend(
+                    [
+                        f"  COUNTIF({sa(f'{col.name}__mismatch')})"
+                        f" AS {sa(f'{col.name}__mismatch_count')}",
+                        f"  MAX({sa(f'{col.name}__max_abs_value_diff')})"
+                        f" AS {sa(f'{col.name}__max_abs_value_diff')}",
+                        f"  AVG({sa(f'{col.name}__max_abs_value_diff')})"
+                        f" AS {sa(f'{col.name}__avg_abs_value_diff')}",
                     ]
                 )
 

@@ -1,7 +1,7 @@
 """Schema introspection for BigQuery tables."""
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
@@ -20,6 +20,10 @@ class ColumnType(Enum):
     BOOLEAN = "boolean"
     GEOGRAPHY = "geography"
     ARRAY = "array"
+    # KLL_QUANTILES sketch columns stored as BYTES. Never auto-detected from
+    # schema alone -- opt-in only, via the --kll-cols / --kll-int-cols flags.
+    KLL_FLOAT64 = "kll_float64"
+    KLL_INT64 = "kll_int64"
     UNSUPPORTED = "unsupported"
 
 
@@ -154,7 +158,68 @@ def _flatten_fields(
     return result
 
 
-def get_table_schema(client: bigquery.Client, table_ref: str) -> list[ColumnInfo]:
+def _apply_kll_classification(
+    columns: list[ColumnInfo],
+    kll_float64_cols: Iterable[str] | None,
+    kll_int64_cols: Iterable[str] | None,
+) -> list[ColumnInfo]:
+    """Reclassify user-flagged BYTES columns as KLL sketches.
+
+    Validation (raises ValueError, before any BQ job runs):
+      - A name may not appear in both sets.
+      - The name must exist in the schema.
+      - The underlying column must be BYTES (UNSUPPORTED via BQ_TYPE_MAP).
+
+    Mutates and returns ``columns``.
+    """
+    float_set = set(kll_float64_cols or ())
+    int_set = set(kll_int64_cols or ())
+    overlap = float_set & int_set
+    if overlap:
+        name = sorted(overlap)[0]
+        raise ValueError(
+            f"column '{name}' cannot be flagged as both --kll-cols "
+            f"and --kll-int-cols"
+        )
+
+    by_name = {c.name: c for c in columns}
+    for name, kll_type, suffix in (
+        (n, ColumnType.KLL_FLOAT64, "FLOAT64") for n in float_set
+    ):
+        _classify_one_kll(by_name, name, kll_type, suffix)
+    for name, kll_type, suffix in (
+        (n, ColumnType.KLL_INT64, "INT64") for n in int_set
+    ):
+        _classify_one_kll(by_name, name, kll_type, suffix)
+    return columns
+
+
+def _classify_one_kll(
+    by_name: dict[str, ColumnInfo],
+    name: str,
+    kll_type: ColumnType,
+    suffix: str,
+) -> None:
+    col = by_name.get(name)
+    if col is None:
+        raise ValueError(
+            f"--kll-cols / --kll-int-cols references unknown column '{name}'"
+        )
+    if col.bq_type != "BYTES":
+        raise ValueError(
+            f"column '{name}' flagged as KLL but has type {col.bq_type}, "
+            f"not BYTES"
+        )
+    col.column_type = kll_type
+    col.bq_type = f"BYTES (KLL_{suffix} sketch)"
+
+
+def get_table_schema(
+    client: bigquery.Client,
+    table_ref: str,
+    kll_float64_cols: Iterable[str] | None = None,
+    kll_int64_cols: Iterable[str] | None = None,
+) -> list[ColumnInfo]:
     """
     Get schema information for a BigQuery table.
 
@@ -164,12 +229,20 @@ def get_table_schema(client: bigquery.Client, table_ref: str) -> list[ColumnInfo
     Args:
         client: BigQuery client
         table_ref: Fully qualified table reference (project.dataset.table)
+        kll_float64_cols: Optional BYTES column names to treat as KLL_FLOAT64
+            sketches (compared via quantile-value comparison at runtime).
+        kll_int64_cols: Same as above for KLL_INT64 sketches.
 
     Returns:
-        List of ColumnInfo objects describing each column
+        List of ColumnInfo objects describing each column.
+
+    Raises:
+        ValueError: If any flagged KLL column is unknown, is not BYTES, or
+            appears in both kll_float64_cols and kll_int64_cols.
     """
     table = client.get_table(table_ref)
-    return _flatten_fields(table.schema)
+    columns = _flatten_fields(table.schema)
+    return _apply_kll_classification(columns, kll_float64_cols, kll_int64_cols)
 
 
 def get_partition_field(client: bigquery.Client, table_ref: str) -> str | None:

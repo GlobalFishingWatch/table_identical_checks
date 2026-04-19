@@ -53,6 +53,8 @@ _TYPE_ABBREV: dict[ColumnType, str] = {
     ColumnType.STRING: "STR",
     ColumnType.GEOGRAPHY: "GEO",
     ColumnType.ARRAY: "ARR",
+    ColumnType.KLL_FLOAT64: "KLLf",
+    ColumnType.KLL_INT64: "KLLi",
 }
 
 
@@ -343,6 +345,19 @@ class VerboseFormatter:
                 lines.append(f"    max_abs_len_delta: {stats.get('max_abs_len_delta')}")
                 lines.append(f"    avg_abs_len_delta: {stats.get('avg_abs_len_delta')}")
 
+        if summary.kll_column_stats:
+            lines.extend(
+                [
+                    "",
+                    "KLL SKETCH COLUMN QUANTILE VALUE DIFFERENCES",
+                    "-" * 40,
+                ]
+            )
+            for col, stats in sorted(summary.kll_column_stats.items()):
+                lines.append(f"  {col}: {stats['mismatch_count']:,} mismatches")
+                lines.append(f"    max_abs_value_diff: {stats.get('max_abs_value_diff')}")
+                lines.append(f"    avg_abs_value_diff: {stats.get('avg_abs_value_diff')}")
+
         lines.extend(
             [
                 "",
@@ -529,6 +544,7 @@ class TableFormatter:
             cols_with_diffs.update(summary.string_column_mismatches.keys())
             cols_with_diffs.update(summary.geography_column_stats.keys())
             cols_with_diffs.update(summary.array_column_stats.keys())
+            cols_with_diffs.update(summary.kll_column_stats.keys())
         return sorted(all_value_cols - cols_with_diffs)
 
     def _build_column_rows(self, summary: "ComparisonSummary") -> list[_ColumnRow]:
@@ -619,6 +635,22 @@ class TableFormatter:
                     total_rows=total_rows,
                     max_abs=stats.get("max_abs_len_delta"),
                     avg_abs=stats.get("avg_abs_len_delta"),
+                    mismatch_count=stats.get("mismatch_count"),
+                )
+            )
+
+        # KLL sketch columns: max_abs / avg_abs slots hold quantile value-diff stats.
+        # max_rel stays None -> renders as "-".
+        for col_name, stats in summary.kll_column_stats.items():
+            col_type = summary.column_types.get(col_name, ColumnType.KLL_FLOAT64)
+            rows.append(
+                _ColumnRow(
+                    name=col_name,
+                    col_type=col_type,
+                    diff_count=cdc.get(col_name, stats.get("mismatch_count")),
+                    total_rows=total_rows,
+                    max_abs=stats.get("max_abs_value_diff"),
+                    avg_abs=stats.get("avg_abs_value_diff"),
                     mismatch_count=stats.get("mismatch_count"),
                 )
             )
@@ -787,6 +819,11 @@ class ComparisonSummary:
         default_factory=dict
     )  # col -> {mismatch_count, max_abs_len_delta, avg_abs_len_delta}
 
+    # KLL sketch column stats (quantile-value equivalence)
+    kll_column_stats: dict[str, dict] = field(
+        default_factory=dict
+    )  # col -> {mismatch_count, max_abs_value_diff, avg_abs_value_diff}
+
     # Columns excluded due to unsupported types
     excluded_columns: list[tuple[str, str]] = field(
         default_factory=list
@@ -885,6 +922,36 @@ def _reject_array_tolerance(builder: QueryBuilder) -> None:
         )
 
 
+def _reject_kll_tolerance(builder: QueryBuilder) -> None:
+    """Raise ValueError if per-column tolerance is set on a KLL column.
+
+    KLL columns compare via quantile-value equivalence; per-column
+    value-space tolerance via --tolerance does not translate directly.
+    Use --kll-abs-tol / --kll-rel-tol to configure the quantile-value
+    thresholds applied across all KLL columns.
+    """
+    tc = builder.tolerance_config
+    if tc is None:
+        return
+    kll_names = {
+        c.name
+        for c in builder.columns
+        if c.column_type in (ColumnType.KLL_FLOAT64, ColumnType.KLL_INT64)
+    }
+    offending = sorted(
+        name
+        for name in kll_names
+        if name in tc.column_tolerances or name in tc.column_rel_tolerances
+    )
+    if offending:
+        col = offending[0]
+        raise ValueError(
+            f"tolerance on KLL column '{col}' is not supported; "
+            f"use --kll-abs-tol / --kll-rel-tol to configure the quantile-value "
+            f"tolerance thresholds"
+        )
+
+
 def check_duplicates(
     client: bigquery.Client,
     builder: QueryBuilder,
@@ -933,6 +1000,7 @@ def generate_summary(
         ComparisonSummary with all statistics
     """
     _reject_array_tolerance(builder)
+    _reject_kll_tolerance(builder)
 
     # Run duplicate check first (cheap, no join)
     dup_a, dup_b = check_duplicates(client, builder)
@@ -1044,6 +1112,7 @@ def _generate_summary_pipeline(
             string_column_mismatches=result.string_column_mismatches or {},
             geography_column_stats=result.geography_column_stats or {},
             array_column_stats=result.array_column_stats or {},
+            kll_column_stats=result.kll_column_stats or {},
             excluded_columns=excluded_columns,
             column_diff_counts=result.column_diff_counts,
             column_types=column_types,
@@ -1072,6 +1141,8 @@ def _generate_summary_pipeline(
         numeric_column_stats=result.numeric_column_stats or {},
         string_column_mismatches=result.string_column_mismatches or {},
         geography_column_stats=result.geography_column_stats or {},
+        array_column_stats=result.array_column_stats or {},
+        kll_column_stats=result.kll_column_stats or {},
         excluded_columns=excluded_columns,
         column_diff_counts=result.column_diff_counts,
         column_types=column_types,

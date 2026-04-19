@@ -30,6 +30,17 @@ DEFAULT_ABS_TOLERANCE = "1e-15"
 DEFAULT_REL_TOLERANCE = "1e-12"
 
 
+def _parse_csv_names(raw: str | None) -> list[str] | None:
+    """Parse a comma-separated list of column names (strip, drop empty).
+
+    Returns None for None/empty input so callers can distinguish "not set".
+    """
+    if not raw:
+        return None
+    names = [part.strip() for part in raw.split(",") if part.strip()]
+    return names or None
+
+
 def _parse_tolerance(tolerance: str | None, rel_tolerance: str | None) -> ToleranceConfig | None:
     """Parse and merge absolute and relative tolerance CLI arguments.
 
@@ -298,6 +309,37 @@ def main():
     type=int,
     help="Max rows to display in stdout (default 20). Full result goes to a temp file.",
 )
+@click.option(
+    "--kll-cols",
+    default=None,
+    help=(
+        "Comma-separated BYTES columns to treat as KLL_QUANTILES.INIT_FLOAT64 "
+        "sketches (compared via quantile-value comparison at 5 probes)"
+    ),
+)
+@click.option(
+    "--kll-int-cols",
+    default=None,
+    help="Comma-separated BYTES columns to treat as KLL_QUANTILES.INIT_INT64 sketches",
+)
+@click.option(
+    "--kll-abs-tol",
+    default=0.0,
+    type=float,
+    help=(
+        "Absolute tolerance on extracted quantile values for KLL comparisons "
+        "(default 0.0; raise for columns with a known scale)"
+    ),
+)
+@click.option(
+    "--kll-rel-tol",
+    default=0.05,
+    type=float,
+    help=(
+        "Relative tolerance on extracted quantile values for KLL comparisons "
+        "(default 0.05; tighten for stricter equivalence)"
+    ),
+)
 def diff(
     table_a: str,
     table_b: str,
@@ -314,6 +356,10 @@ def diff(
     expiration_hours: int | None,
     only_diffs: bool,
     max_display_rows: int,
+    kll_cols: str | None,
+    kll_int_cols: str | None,
+    kll_abs_tol: float,
+    kll_rel_tol: float,
 ):
     """Compare two tables and show differences."""
     from .backend.pipeline import differing_columns, run_pipeline
@@ -326,9 +372,17 @@ def diff(
 
     client = bigquery.Client()
 
+    kll_float_names = _parse_csv_names(kll_cols)
+    kll_int_names = _parse_csv_names(kll_int_cols)
+
     # Get schema from table_a (assuming both have same schema)
     click.echo(f"Fetching schema from {table_a}...")
-    columns = get_table_schema(client, table_a)
+    columns = get_table_schema(
+        client,
+        table_a,
+        kll_float64_cols=kll_float_names,
+        kll_int64_cols=kll_int_names,
+    )
 
     # Get partition filters (auto-detect or use provided)
     filter_a, filter_b = get_partition_filters(
@@ -347,6 +401,8 @@ def diff(
         partition_filter_a=filter_a,
         partition_filter_b=filter_b,
         tolerance_config=tolerance_config,
+        kll_abs_tol=kll_abs_tol,
+        kll_rel_tol=kll_rel_tol,
     )
     _warn_excluded_columns(builder)
 
@@ -522,6 +578,37 @@ def count(
     default=None,
     help="Write the ComparisonSummary to a JSON file (consumable by `format` and `verify-query`)",
 )
+@click.option(
+    "--kll-cols",
+    default=None,
+    help=(
+        "Comma-separated BYTES columns to treat as KLL_QUANTILES.INIT_FLOAT64 "
+        "sketches (compared via quantile-value comparison at 5 probes)"
+    ),
+)
+@click.option(
+    "--kll-int-cols",
+    default=None,
+    help="Comma-separated BYTES columns to treat as KLL_QUANTILES.INIT_INT64 sketches",
+)
+@click.option(
+    "--kll-abs-tol",
+    default=0.0,
+    type=float,
+    help=(
+        "Absolute tolerance on extracted quantile values for KLL comparisons "
+        "(default 0.0; raise for columns with a known scale)"
+    ),
+)
+@click.option(
+    "--kll-rel-tol",
+    default=0.05,
+    type=float,
+    help=(
+        "Relative tolerance on extracted quantile values for KLL comparisons "
+        "(default 0.05; tighten for stricter equivalence)"
+    ),
+)
 def summary(
     table_a: str,
     table_b: str,
@@ -536,6 +623,10 @@ def summary(
     max_diff_pct: float,
     legacy: bool,
     output_json: str | None,
+    kll_cols: str | None,
+    kll_int_cols: str | None,
+    kll_abs_tol: float,
+    kll_rel_tol: float,
 ):
     """Generate a comprehensive comparison summary."""
     key_columns = [k.strip() for k in keys.split(",")]
@@ -546,8 +637,16 @@ def summary(
     client = bigquery.Client()
     _log_client_info(client)
 
+    kll_float_names = _parse_csv_names(kll_cols)
+    kll_int_names = _parse_csv_names(kll_int_cols)
+
     click.echo(f"Fetching schema from {table_a}...")
-    columns = get_table_schema(client, table_a)
+    columns = get_table_schema(
+        client,
+        table_a,
+        kll_float64_cols=kll_float_names,
+        kll_int64_cols=kll_int_names,
+    )
 
     # Get partition filters
     filter_a, filter_b = get_partition_filters(
@@ -565,6 +664,8 @@ def summary(
         partition_filter_a=filter_a,
         partition_filter_b=filter_b,
         tolerance_config=tolerance_config,
+        kll_abs_tol=kll_abs_tol,
+        kll_rel_tol=kll_rel_tol,
     )
     _warn_excluded_columns(builder)
 
