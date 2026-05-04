@@ -1710,6 +1710,10 @@ def build_verify_query(summary: ComparisonSummary) -> str:
     a_src = _source(summary.table_a, summary.partition_filter_a)
     b_src = _source(summary.table_b, summary.partition_filter_b)
 
+    # Order the final result by the join keys, then by `which`, so missing
+    # rows for the same key on either side appear together.
+    order_cols = ", ".join([*summary.key_columns, "which"])
+
     return (
         f"WITH a AS (\n"
         f"  SELECT *{except_clause} FROM {a_src}\n"
@@ -1726,8 +1730,12 @@ def build_verify_query(summary: ComparisonSummary) -> str:
         f"  SELECT * FROM a\n"
         f"  EXCEPT DISTINCT\n"
         f"  SELECT * FROM b\n"
+        f"),\n\n"
+        f"combined AS (\n"
+        f"  SELECT 'missing_in_a' AS which, * FROM missing_in_a\n"
+        f"  UNION ALL\n"
+        f"  SELECT 'missing_in_b' AS which, * FROM missing_in_b\n"
         f")\n\n"
-        f"SELECT 'missing_in_a' AS which, * FROM missing_in_a\n"
-        f"UNION ALL\n"
-        f"SELECT 'missing_in_b' AS which, * FROM missing_in_b"
+        f"SELECT * FROM combined\n"
+        f"ORDER BY {order_cols}"
     )
