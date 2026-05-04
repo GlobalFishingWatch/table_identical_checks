@@ -1,5 +1,6 @@
 """Command-line interface for table identical checks."""
 
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -28,6 +29,22 @@ from .backend import (
 # Combined via OR: a value is within tolerance if EITHER condition holds.
 DEFAULT_ABS_TOLERANCE = "1e-15"
 DEFAULT_REL_TOLERANCE = "1e-12"
+
+
+def _default_summary_json_path(table_a: str, table_b: str, keys: Sequence[str]) -> str:
+    """Return a deterministic cache path for the summary JSON.
+
+    The path identity is keyed on table_a, table_b, and the (sorted) key set,
+    so re-running the same comparison overwrites the same file. Tolerance and
+    formatting flags do *not* enter the hash: those describe how to interpret
+    the comparison, not which comparison it is.
+    """
+    fingerprint = f"{table_a}|{table_b}|{','.join(sorted(keys))}"
+    h = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:12]
+    cache_root = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    out_dir = os.path.join(cache_root, "table-check")
+    os.makedirs(out_dir, exist_ok=True)
+    return os.path.join(out_dir, f"{h}.json")
 
 
 def _parse_csv_names(raw: str | None) -> list[str] | None:
@@ -576,7 +593,11 @@ def count(
 @click.option(
     "--output-json",
     default=None,
-    help="Write the ComparisonSummary to a JSON file (consumable by `format` and `verify-query`)",
+    help=(
+        "Write the ComparisonSummary to a JSON file (consumable by `format` and "
+        "`verify-query`). Defaults to a deterministic path under "
+        "$XDG_CACHE_HOME/table-check/ keyed on table_a + table_b + keys."
+    ),
 )
 @click.option(
     "--kll-cols",
@@ -683,10 +704,10 @@ def summary(
     click.echo("")
     click.echo(str(result))
 
-    if output_json:
-        with open(output_json, "w") as f:
-            json.dump(to_json_dict(result), f, indent=2, default=str)
-        click.echo(f"\nSummary written to {output_json}")
+    json_path = output_json or _default_summary_json_path(table_a, table_b, key_columns)
+    with open(json_path, "w") as f:
+        json.dump(to_json_dict(result), f, indent=2, default=str)
+    click.echo(f"\nSummary written to {json_path}")
 
 
 @main.command("format")
