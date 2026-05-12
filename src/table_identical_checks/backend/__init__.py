@@ -2,7 +2,7 @@
 
 from .pipeline import PipelineConfig, PipelineResult, differing_columns, run_pipeline
 from .query_builder import QueryBuilder
-from .schema import ColumnType, get_partition_field, get_table_schema
+from .schema import ColumnInfo, ColumnType, get_partition_field, get_table_schema
 from .summary import (
     ComparisonSummary,
     DimensionBucket,
@@ -27,6 +27,7 @@ __all__ = [
     "QueryBuilder",
     "get_table_schema",
     "get_partition_field",
+    "ColumnInfo",
     "ColumnType",
     "ComparisonSummary",
     "DuplicateInfo",

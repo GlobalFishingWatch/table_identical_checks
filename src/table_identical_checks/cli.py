@@ -12,6 +12,7 @@ from google.cloud import bigquery
 from tabulate import tabulate
 
 from .backend import (
+    ColumnInfo,
     PipelineConfig,
     QueryBuilder,
     ToleranceConfig,
@@ -82,6 +83,33 @@ def _parse_tolerance(tolerance: str | None, rel_tolerance: str | None) -> Tolera
     return abs_config or rel_config
 
 
+# Sentinel date used by the auto-generated dummy partition filter. Any value
+# *other* than this date passes the filter — picking a date in the distant past
+# minimises the chance of dropping real rows. NULLs are preserved separately
+# via an explicit IS NULL branch (see _build_dummy_partition_filter).
+DEFAULT_PARTITION_SENTINEL_DATE = "1979-01-01"
+
+
+def _build_dummy_partition_filter(
+    partition_col: str,
+    sentinel_date: str = DEFAULT_PARTITION_SENTINEL_DATE,
+) -> str:
+    """Build a NULL-safe dummy filter satisfying BQ's partition requirement.
+
+    BigQuery requires queries against partition-filtered tables to reference
+    the partition column in WHERE. A naive ``DATE(col) != 'sentinel'`` works
+    for non-null partition values but silently drops rows in the ``__NULL__``
+    partition, because ``NULL != 'sentinel'`` evaluates to NULL, not TRUE.
+
+    The ``IS NULL`` branch is recognised by BQ's partition elimination as
+    targeting the NULL partition, so this stays cheap.
+    """
+    return (
+        f"({partition_col} IS NULL "
+        f"OR DATE({partition_col}) != '{sentinel_date}')"
+    )
+
+
 def get_partition_filters(
     client: bigquery.Client,
     table_a: str,
@@ -93,20 +121,11 @@ def get_partition_filters(
     Get partition filters for both tables.
 
     If user provides filters, use those. Otherwise, auto-detect partition fields
-    and create dummy filters that satisfy partition elimination requirements.
+    and create dummy filters that satisfy partition elimination requirements
+    while preserving rows in the NULL partition.
 
     Auto-detection is best-effort: if it fails (e.g. due to cross-project
     permissions), we proceed without a filter and warn the user.
-
-    Args:
-        client: BigQuery client
-        table_a: First table reference
-        table_b: Second table reference
-        partition_filter_a: User-provided filter for table A (or None)
-        partition_filter_b: User-provided filter for table B (or None)
-
-    Returns:
-        Tuple of (filter_a, filter_b) where each can be None if no partition
     """
     from table_identical_checks.backend import get_partition_field
 
@@ -116,7 +135,7 @@ def get_partition_filters(
         try:
             partition_col_a = get_partition_field(client, table_a)
             if partition_col_a:
-                final_filter_a = f"DATE({partition_col_a}) != '1979-01-01'"
+                final_filter_a = _build_dummy_partition_filter(partition_col_a)
                 click.echo(f"Auto-detected partition column '{partition_col_a}' for table A")
         except Exception as e:
             click.echo(
@@ -131,7 +150,7 @@ def get_partition_filters(
         try:
             partition_col_b = get_partition_field(client, table_b)
             if partition_col_b:
-                final_filter_b = f"DATE({partition_col_b}) != '1979-01-01'"
+                final_filter_b = _build_dummy_partition_filter(partition_col_b)
                 click.echo(f"Auto-detected partition column '{partition_col_b}' for table B")
         except Exception as e:
             click.echo(
@@ -203,6 +222,94 @@ def _warn_excluded_columns(builder: QueryBuilder) -> None:
         click.secho(f"  {col_info.name:<30} {col_info.bq_type}", fg="yellow")
     click.secho("!" * 60, fg="yellow", bold=True)
     click.echo("")
+
+
+def _intersect_table_schemas(
+    client: bigquery.Client,
+    table_a: str,
+    table_b: str,
+    key_columns: Sequence[str],
+    kll_float64_cols: Sequence[str] | None = None,
+    kll_int64_cols: Sequence[str] | None = None,
+) -> list[ColumnInfo]:
+    """Fetch schemas from both tables, return the intersection on name+type.
+
+    Columns present in only one table, and columns whose ColumnType or bq_type
+    differs between the two, are dropped from the comparison and reported via
+    a yellow warning. Key columns are required on both sides — if any key is
+    missing from either schema, a ``click.ClickException`` is raised.
+
+    Returns:
+        The list of ``ColumnInfo`` (from table A's schema) whose names appear
+        on both sides with matching types. KLL reclassification has already
+        been applied to A's columns.
+    """
+    click.echo(f"Fetching schema from {table_a}...")
+    cols_a = get_table_schema(
+        client,
+        table_a,
+        kll_float64_cols=kll_float64_cols,
+        kll_int64_cols=kll_int64_cols,
+    )
+    click.echo(f"Fetching schema from {table_b}...")
+    cols_b = get_table_schema(
+        client,
+        table_b,
+        kll_float64_cols=kll_float64_cols,
+        kll_int64_cols=kll_int64_cols,
+    )
+
+    by_name_a = {c.name: c for c in cols_a}
+    by_name_b = {c.name: c for c in cols_b}
+
+    only_in_a = [c for c in cols_a if c.name not in by_name_b]
+    only_in_b = [c for c in cols_b if c.name not in by_name_a]
+    type_mismatches: list[tuple[ColumnInfo, ColumnInfo]] = []
+    common: list[ColumnInfo] = []
+    for col in cols_a:
+        other = by_name_b.get(col.name)
+        if other is None:
+            continue
+        if col.column_type != other.column_type or col.bq_type != other.bq_type:
+            type_mismatches.append((col, other))
+            continue
+        common.append(col)
+
+    # Hard error: every requested key must exist on both sides.
+    missing_keys_a = [k for k in key_columns if k not in by_name_a]
+    missing_keys_b = [k for k in key_columns if k not in by_name_b]
+    if missing_keys_a or missing_keys_b:
+        msg_parts = []
+        if missing_keys_a:
+            msg_parts.append(f"missing in {table_a}: {missing_keys_a}")
+        if missing_keys_b:
+            msg_parts.append(f"missing in {table_b}: {missing_keys_b}")
+        raise click.ClickException(
+            "Key column(s) not found in both schemas — " + "; ".join(msg_parts)
+        )
+
+    if only_in_a or only_in_b or type_mismatches:
+        click.echo("")
+        click.secho("!" * 60, fg="yellow", bold=True)
+        click.secho(
+            "!! WARNING: Schema mismatch — columns excluded from comparison !!",
+            fg="yellow",
+            bold=True,
+        )
+        click.secho("!" * 60, fg="yellow", bold=True)
+        for c in only_in_a:
+            click.secho(f"  only in A    {c.name:<30} {c.bq_type}", fg="yellow")
+        for c in only_in_b:
+            click.secho(f"  only in B    {c.name:<30} {c.bq_type}", fg="yellow")
+        for ca, cb in type_mismatches:
+            click.secho(
+                f"  type diff    {ca.name:<30} A={ca.bq_type}  B={cb.bq_type}",
+                fg="yellow",
+            )
+        click.secho("!" * 60, fg="yellow", bold=True)
+        click.echo("")
+
+    return common
 
 
 def _rows_to_dicts(rows: Sequence[bigquery.Row]) -> list[dict[str, object]]:
@@ -392,11 +499,11 @@ def diff(
     kll_float_names = _parse_csv_names(kll_cols)
     kll_int_names = _parse_csv_names(kll_int_cols)
 
-    # Get schema from table_a (assuming both have same schema)
-    click.echo(f"Fetching schema from {table_a}...")
-    columns = get_table_schema(
+    columns = _intersect_table_schemas(
         client,
         table_a,
+        table_b,
+        key_columns,
         kll_float64_cols=kll_float_names,
         kll_int64_cols=kll_int_names,
     )
@@ -513,7 +620,7 @@ def count(
 
     client = bigquery.Client()
 
-    columns = get_table_schema(client, table_a)
+    columns = _intersect_table_schemas(client, table_a, table_b, key_columns)
 
     # Get partition filters
     filter_a, filter_b = get_partition_filters(
@@ -661,10 +768,11 @@ def summary(
     kll_float_names = _parse_csv_names(kll_cols)
     kll_int_names = _parse_csv_names(kll_int_cols)
 
-    click.echo(f"Fetching schema from {table_a}...")
-    columns = get_table_schema(
+    columns = _intersect_table_schemas(
         client,
         table_a,
+        table_b,
+        key_columns,
         kll_float64_cols=kll_float_names,
         kll_int64_cols=kll_int_names,
     )
@@ -793,8 +901,7 @@ def breakdown(
 
     client = bigquery.Client()
 
-    click.echo(f"Fetching schema from {table_a}...")
-    columns = get_table_schema(client, table_a)
+    columns = _intersect_table_schemas(client, table_a, table_b, key_columns)
 
     # Get partition filters
     filter_a, filter_b = get_partition_filters(
