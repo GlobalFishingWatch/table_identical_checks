@@ -3,7 +3,13 @@
 import pytest
 from google.cloud import bigquery
 
-from table_identical_checks.backend import QueryBuilder, get_table_schema
+from table_identical_checks.backend import (
+    PipelineConfig,
+    QueryBuilder,
+    ToleranceConfig,
+    get_table_schema,
+)
+from table_identical_checks.backend.pipeline import run_pipeline
 
 # Schema for numeric test tables
 NUMERIC_SCHEMA = [
@@ -282,3 +288,116 @@ class TestNullValues:
         count = list(result)[0].diff_count
 
         assert count == 1
+
+
+# Schema with two FLOAT columns so we can verify per-column tolerance counts
+# don't bleed across columns when only one of them differs in a given row.
+TWO_FLOAT_SCHEMA = [
+    bigquery.SchemaField("id", "INT64"),
+    bigquery.SchemaField("a", "FLOAT64"),
+    bigquery.SchemaField("b", "FLOAT64"),
+]
+
+
+class TestPerColumnToleranceCounts:
+    """Regression tests for the per-column within/outside tolerance counts.
+
+    The L3 aggregation runs over all rows that differ in *any* column. Without
+    a per-column "actually differs" guard, the within-tol count for column X
+    incorrectly includes rows where X was exactly equal (and the row is in L2
+    only because some *other* column differs). The fix asserts the invariant
+    ``within_tol + outside_tol == column_diff_count`` for every toleranced
+    column.
+    """
+
+    def test_within_tol_does_not_include_equal_rows(self, bq_client, table_factory):
+        rows_a = [
+            {"id": 1, "a": 1.0, "b": 10.0},
+            {"id": 2, "a": 2.0, "b": 20.0},
+            {"id": 3, "a": 3.0, "b": 30.0},
+        ]
+        # Row 1: only a differs (within tol). Row 2: only b differs (within tol).
+        # Row 3: identical -> not in L2 at all.
+        rows_b = [
+            {"id": 1, "a": 1.0 + 1e-12, "b": 10.0},
+            {"id": 2, "a": 2.0, "b": 20.0 + 1e-12},
+            {"id": 3, "a": 3.0, "b": 30.0},
+        ]
+        table_a = table_factory(TWO_FLOAT_SCHEMA, rows_a)
+        table_b = table_factory(TWO_FLOAT_SCHEMA, rows_b)
+
+        columns = get_table_schema(bq_client, table_a)
+        tol = ToleranceConfig.parse("a:1e-9,b:1e-9")
+        builder = QueryBuilder(
+            table_a=table_a,
+            table_b=table_b,
+            key_columns=["id"],
+            columns=columns,
+            tolerance_config=tol,
+        )
+        result = run_pipeline(bq_client, builder, PipelineConfig(max_diff_pct=1.0))
+
+        assert result.pipeline_status == "COMPLETED"
+        assert result.column_diff_counts["a"] == 1
+        assert result.column_diff_counts["b"] == 1
+
+        assert result.numeric_column_stats is not None
+        stats_a = result.numeric_column_stats["a"]
+        stats_b = result.numeric_column_stats["b"]
+
+        # The fix: counts cover only rows where THIS column differs.
+        assert stats_a["within_tolerance_count"] == 1
+        assert stats_a["outside_tolerance_count"] == 0
+        assert stats_b["within_tolerance_count"] == 1
+        assert stats_b["outside_tolerance_count"] == 0
+
+        # Invariant: within + outside == column-level diff count.
+        assert (
+            stats_a["within_tolerance_count"] + stats_a["outside_tolerance_count"]
+            == result.column_diff_counts["a"]
+        )
+        assert (
+            stats_b["within_tolerance_count"] + stats_b["outside_tolerance_count"]
+            == result.column_diff_counts["b"]
+        )
+
+    def test_outside_tol_count_separates_from_within(self, bq_client, table_factory):
+        rows_a = [
+            {"id": 1, "a": 1.0, "b": 10.0},
+            {"id": 2, "a": 2.0, "b": 20.0},
+        ]
+        # Row 1: a differs above tolerance. Row 2: a differs within tolerance.
+        # b is equal in both rows.
+        rows_b = [
+            {"id": 1, "a": 1.5, "b": 10.0},
+            {"id": 2, "a": 2.0 + 1e-12, "b": 20.0},
+        ]
+        table_a = table_factory(TWO_FLOAT_SCHEMA, rows_a)
+        table_b = table_factory(TWO_FLOAT_SCHEMA, rows_b)
+
+        columns = get_table_schema(bq_client, table_a)
+        tol = ToleranceConfig.parse("a:1e-9,b:1e-9")
+        builder = QueryBuilder(
+            table_a=table_a,
+            table_b=table_b,
+            key_columns=["id"],
+            columns=columns,
+            tolerance_config=tol,
+        )
+        result = run_pipeline(bq_client, builder, PipelineConfig(max_diff_pct=1.0))
+
+        assert result.pipeline_status == "COMPLETED"
+        assert result.column_diff_counts["a"] == 2
+        assert result.column_diff_counts["b"] == 0
+
+        assert result.numeric_column_stats is not None
+        stats_a = result.numeric_column_stats["a"]
+        assert stats_a["within_tolerance_count"] == 1
+        assert stats_a["outside_tolerance_count"] == 1
+
+        # b never differs, so its within/outside counts must be zero — the bug
+        # would have charged each L2 row's within_tol flag against b.
+        stats_b = result.numeric_column_stats.get("b")
+        if stats_b is not None:
+            assert stats_b.get("within_tolerance_count", 0) == 0
+            assert stats_b.get("outside_tolerance_count", 0) == 0

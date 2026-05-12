@@ -1276,10 +1276,16 @@ class QueryBuilder:
                 )
                 if col.column_type == ColumnType.FLOAT and col.name in tol_cols:
                     wt = sa(f"{col.name}__within_tol")
+                    eq = sa(f"{col.name}__eq")
+                    # Restrict tolerance counts to rows where THIS column differs.
+                    # Without the NOT eq guard, "within_tol" is also true for rows
+                    # that landed in L2 because some *other* column differs — which
+                    # would inflate the count well past the column's diff count.
                     l3_stats_parts.extend(
                         [
-                            f"  COUNTIF({wt}) AS {sa(f'{col.name}__within_tol_count')}",
-                            f"  COUNTIF(NOT {wt})"
+                            f"  COUNTIF(NOT {eq} AND {wt})"
+                            f" AS {sa(f'{col.name}__within_tol_count')}",
+                            f"  COUNTIF(NOT {eq} AND NOT {wt})"
                             f" AS {sa(f'{col.name}__outside_tol_count')}",
                         ]
                     )
@@ -1330,10 +1336,12 @@ class QueryBuilder:
                 )
                 if col.name in tol_cols:
                     wt = sa(f"{col.name}__within_tol")
+                    eq = sa(f"{col.name}__eq")
                     l3_stats_parts.extend(
                         [
-                            f"  COUNTIF({wt}) AS {sa(f'{col.name}__within_tol_count')}",
-                            f"  COUNTIF(NOT {wt})"
+                            f"  COUNTIF(NOT {eq} AND {wt})"
+                            f" AS {sa(f'{col.name}__within_tol_count')}",
+                            f"  COUNTIF(NOT {eq} AND NOT {wt})"
                             f" AS {sa(f'{col.name}__outside_tol_count')}",
                         ]
                     )
