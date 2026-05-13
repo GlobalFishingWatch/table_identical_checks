@@ -934,6 +934,111 @@ class QueryBuilder:
         b = f"{self.alias_b}.{col_name}"
         return literal_column(f"NOT {self._l1_kll_eq(col_name, column_type, a, b)}")
 
+    def _geography_within_tol_sql(
+        self, col_name: str, a_alias: str = "a", b_alias: str = "b"
+    ) -> str:
+        """Raw SQL for geography within-tolerance check (NULL-safe).
+
+        Mirrors the inline expression in :meth:`_build_geography_select_columns`
+        but takes explicit table aliases so it can be reused at L1 against the
+        FULL OUTER JOIN.
+        """
+        if not self.tolerance_config:
+            return "TRUE"
+        tolerance = self.tolerance_config.get_tolerance(col_name)
+        if tolerance is None:
+            return "TRUE"
+        a_ref = f"{a_alias}.{col_name}"
+        b_ref = f"{b_alias}.{col_name}"
+        return (
+            f"IF({a_ref} IS NOT NULL AND {b_ref} IS NOT NULL, "
+            f"ST_DISTANCE({a_ref}, {b_ref}) <= {tolerance}, "
+            f"({a_ref} IS NULL AND {b_ref} IS NULL))"
+        )
+
+    def _l1_row_within_tolerance_sql(
+        self, value_cols, tol_cols: set[str]
+    ) -> str | None:
+        """Build the per-row "row passes tolerance" AND-chain for L1.
+
+        Returns ``None`` when no value columns have tolerance (in which case
+        the caller should skip emitting the flag entirely — L1's WHERE clause
+        already guarantees every row has at least one diff).
+
+        For each value column the contribution is:
+          - tolerance configured -> the column's within-tol predicate
+            (which is strictly weaker than the eq flag, so absorbing equality)
+          - no tolerance         -> the column's strict-equality predicate
+
+        The expressions are inlined rather than referencing L1's per-column
+        ``__eq`` aliases because aliases defined in the same SELECT list are
+        not in scope for sibling expressions in BigQuery.
+        """
+        if not tol_cols:
+            return None
+        parts: list[str] = []
+        for col in value_cols:
+            if col.name in tol_cols:
+                if col.column_type == ColumnType.FLOAT:
+                    parts.append(
+                        self._float_within_tol_sql(f"a.{col.name}", f"b.{col.name}", col.name)
+                    )
+                elif col.column_type == ColumnType.GEOGRAPHY:
+                    parts.append(self._geography_within_tol_sql(col.name))
+                else:
+                    parts.append(self._l1_null_safe_eq(col.name))
+            else:
+                if col.column_type == ColumnType.GEOGRAPHY:
+                    parts.append(self._l1_geography_eq(col.name))
+                elif col.column_type == ColumnType.ARRAY:
+                    parts.append(self._l1_array_eq(col.name))
+                elif col.column_type in (ColumnType.KLL_FLOAT64, ColumnType.KLL_INT64):
+                    parts.append(self._l1_kll_eq(col.name, col.column_type))
+                else:
+                    parts.append(self._l1_null_safe_eq(col.name))
+        return " AND ".join(f"({p})" for p in parts)
+
+    def _build_diff_split_statement(
+        self,
+        output_table: str,
+        source_alias: str,
+        source_sql: str,
+        diff_filter: str,
+        write_mode: str,
+        expiration_hours: int,
+    ) -> str:
+        """Render a single ``CREATE [OR REPLACE] TABLE`` for one side's diff.
+
+        Uses an EXISTS subquery against ``_l1`` rather than a JOIN so that
+        duplicate keys in the source table do not fan out the output. The
+        semantics are: keep every row from the source whose key participates
+        in at least one L1 row matching the diff filter.
+        """
+        create_kw = "CREATE OR REPLACE TABLE" if write_mode == "replace" else "CREATE TABLE"
+        if expiration_hours > 0:
+            options = (
+                f"\nOPTIONS (\n"
+                f"  expiration_timestamp = "
+                f"TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {expiration_hours} HOUR)\n"
+                f")"
+            )
+        else:
+            options = ""
+        key_match = " AND ".join(
+            f"_l1.{k} = {source_alias}.{k}" for k in self.key_columns
+        )
+        return (
+            f"{create_kw} `{output_table}`{options}\n"
+            f"AS\n"
+            f"SELECT {source_alias}.*\n"
+            f"FROM {source_sql}\n"
+            f"WHERE EXISTS (\n"
+            f"  SELECT 1 FROM _l1\n"
+            f"  WHERE {key_match}\n"
+            f"    AND {diff_filter}\n"
+            f");\n"
+        )
+
     def _float_within_tol_sql(self, a: str, b: str, col_name: str) -> str:
         """Build a raw SQL expression for float within-tolerance check.
 
@@ -978,7 +1083,11 @@ class QueryBuilder:
         """Build COALESCE(a.key, b.key) AS key for each key column."""
         return ",\n  ".join(f"COALESCE(a.{k}, b.{k}) AS {k}" for k in self.key_columns)
 
-    def build_pipeline_script(self, max_diff_pct: float = 1.0) -> str:
+    def build_pipeline_script(
+        self,
+        max_diff_pct: float = 1.0,
+        output_diff=None,
+    ) -> str:
         """Build the 3-layer multi-statement SQL script.
 
         This generates a BigQuery scripting block that:
@@ -988,10 +1097,18 @@ class QueryBuilder:
           4. Layer 2: Computes all deltas for non-identical rows (INNER JOIN)
           5. Layer 3: Aggregates all statistics into a single output row
 
+        When ``output_diff`` (an :class:`OutputDiffConfig`) is set, the script
+        also writes two filtered copies of the source tables — one per side —
+        containing only rows that contribute to the diff after tolerance.
+        The CREATE TABLE statements re-use the in-flight ``_l1`` temp table
+        and run in both branches of the circuit-breaker IF/ELSE.
+
         Args:
             max_diff_pct: Circuit breaker threshold as a fraction (0.1 = 10%).
                          Default 1.0 (100%) effectively disables the breaker.
                          If more than this fraction of rows differ, abort after Layer 1.
+            output_diff: Optional OutputDiffConfig for materialising filtered
+                         per-side diff tables.
 
         Returns:
             A multi-statement SQL script string to execute as a single BQ job.
@@ -1043,6 +1160,16 @@ class QueryBuilder:
                 eq_expr = self._l1_null_safe_eq(col.name)
             eq_alias = self._safe_alias(f"{col.name}__eq")
             l1_select_parts.append(f"  {eq_expr} AS {eq_alias}")
+
+        # Optional: row-level "passes tolerance" flag used by --write-diffs to
+        # decide which matched rows belong in the per-side diff outputs.
+        row_wt_expr = None
+        if output_diff is not None:
+            row_wt_expr = self._l1_row_within_tolerance_sql(value_cols, tol_cols)
+            if row_wt_expr is not None:
+                l1_select_parts.append(
+                    f"  ({row_wt_expr}) AS row_within_tolerance"
+                )
 
         l1_select = ",\n".join(l1_select_parts)
 
@@ -1379,15 +1506,61 @@ class QueryBuilder:
             ") l3_stats;\n"
         )
 
+        # --- Optional: --write-diffs CREATE TABLE statements ---
+        # Two statements (one per side) emitted in both IF branches so the
+        # diff copies are materialised even when the circuit breaker fires.
+        diff_split_stmts = ""
+        if output_diff is not None:
+            # If no tolerance is configured, every L1 row is a real diff
+            # (L1's WHERE already enforces that), so we don't need the
+            # row_within_tolerance reference in the filter.
+            if row_wt_expr is not None:
+                filter_a = (
+                    "_l1.in_a AND "
+                    "(NOT _l1.in_b OR NOT _l1.row_within_tolerance)"
+                )
+                filter_b = (
+                    "_l1.in_b AND "
+                    "(NOT _l1.in_a OR NOT _l1.row_within_tolerance)"
+                )
+            else:
+                filter_a = "_l1.in_a"
+                filter_b = "_l1.in_b"
+
+            stmt_a = self._build_diff_split_statement(
+                output_table=output_diff.output_a,
+                source_alias="a",
+                source_sql=source_a_join,
+                diff_filter=filter_a,
+                write_mode=output_diff.write_mode,
+                expiration_hours=output_diff.expiration_hours,
+            )
+            stmt_b = self._build_diff_split_statement(
+                output_table=output_diff.output_b,
+                source_alias="b",
+                source_sql=source_b_join,
+                diff_filter=filter_b,
+                write_mode=output_diff.write_mode,
+                expiration_hours=output_diff.expiration_hours,
+            )
+            diff_split_stmts = f"{stmt_a}{stmt_b}"
+
         # --- Assemble the full script ---
+        # Diff-split CREATE TABLE statements are emitted BEFORE the final
+        # SELECT in each branch. BigQuery returns the script's last-emitted
+        # SELECT to the client; putting DDL after that SELECT would mask the
+        # summary row behind the empty DDL result. The CREATE TABLEs only
+        # need _l1 which is built earlier, so order-before-SELECT is safe.
         script = (
             f"{preamble}\n"
             f"{l1_stmt}\n"
             f"{circuit_breaker}\n"
             f"IF rows_in_both_diff > GREATEST(total_rows_a, total_rows_b) * {max_diff_pct} THEN\n"
+            f"  {diff_split_stmts}"
             f"  {abort_stmt}\n"
             "ELSE\n"
             f"  {l2_stmt}\n"
+            f"  {diff_split_stmts}"
             f"  {l3_stmt}\n"
             "END IF;\n"
         )

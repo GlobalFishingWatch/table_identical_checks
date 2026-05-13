@@ -1,6 +1,12 @@
 """Backend module for BigQuery operations."""
 
-from .pipeline import PipelineConfig, PipelineResult, differing_columns, run_pipeline
+from .pipeline import (
+    OutputDiffConfig,
+    PipelineConfig,
+    PipelineResult,
+    differing_columns,
+    run_pipeline,
+)
 from .query_builder import QueryBuilder
 from .schema import ColumnInfo, ColumnType, get_partition_field, get_table_schema
 from .summary import (
@@ -22,6 +28,7 @@ from .summary import (
 from .tolerance import ToleranceConfig
 
 __all__ = [
+    "OutputDiffConfig",
     "PipelineConfig",
     "PipelineResult",
     "QueryBuilder",

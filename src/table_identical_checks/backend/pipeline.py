@@ -1,11 +1,37 @@
 """Pipeline orchestrator for multi-layer query execution."""
 
 from dataclasses import dataclass
+from typing import Literal
 
 from google.cloud import bigquery
 
 from .query_builder import QueryBuilder
 from .schema import ColumnType
+
+
+@dataclass
+class OutputDiffConfig:
+    """Configuration for materialising filtered diff copies of both inputs.
+
+    When set on a :class:`PipelineConfig`, the pipeline appends two
+    ``CREATE TABLE`` statements that write per-side row subsets to BQ:
+      - ``output_a`` receives rows present in table A whose row is either
+        absent from B or differs after tolerance.
+      - ``output_b`` is the mirror for table B.
+
+    Attributes:
+        output_a: Fully-qualified output table for A's filtered rows.
+        output_b: Fully-qualified output table for B's filtered rows.
+        write_mode: ``"error"`` -> ``CREATE TABLE`` (fails if exists);
+            ``"replace"`` -> ``CREATE OR REPLACE TABLE``.
+        expiration_hours: Hours until BQ auto-expires the output tables.
+            ``0`` disables the OPTIONS clause and writes without expiration.
+    """
+
+    output_a: str
+    output_b: str
+    write_mode: Literal["error", "replace"] = "error"
+    expiration_hours: int = 168
 
 
 @dataclass
@@ -16,9 +42,12 @@ class PipelineConfig:
         max_diff_pct: Circuit breaker threshold as a fraction (0.1 = 10%).
                      If more than this fraction of rows differ, abort after Layer 1.
                      Default 1.0 (100%) effectively disables the breaker.
+        output_diff: When set, the pipeline additionally writes two filtered
+                     copies of the source tables (see :class:`OutputDiffConfig`).
     """
 
     max_diff_pct: float = 1.0
+    output_diff: OutputDiffConfig | None = None
 
 
 @dataclass
@@ -217,7 +246,10 @@ def run_pipeline(
     Returns:
         PipelineResult with all statistics from the pipeline execution.
     """
-    script = builder.build_pipeline_script(max_diff_pct=config.max_diff_pct)
+    script = builder.build_pipeline_script(
+        max_diff_pct=config.max_diff_pct,
+        output_diff=config.output_diff,
+    )
     # Execute the multi-statement script. BQ returns the result of the last SELECT.
     query_job = client.query(script)
     # For multi-statement scripts, we need to iterate through child jobs

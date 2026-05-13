@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 from typing import Sequence
 
@@ -13,6 +14,7 @@ from tabulate import tabulate
 
 from .backend import (
     ColumnInfo,
+    OutputDiffConfig,
     PipelineConfig,
     QueryBuilder,
     ToleranceConfig,
@@ -222,6 +224,91 @@ def _warn_excluded_columns(builder: QueryBuilder) -> None:
         click.secho(f"  {col_info.name:<30} {col_info.bq_type}", fg="yellow")
     click.secho("!" * 60, fg="yellow", bold=True)
     click.echo("")
+
+
+# --- Diff-split output resolution ---------------------------------------
+
+_FQN_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+_PROJECT_DATASET_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+TIC_OUTPUT_PREFIX = "DIFF_"
+ENV_OUTPUT_DATASET = "TABLE_CHECK_OUTPUT_DATASET"
+
+
+def _basename(table_ref: str) -> str:
+    """Return the last `.`-separated segment of a table reference."""
+    return table_ref.rsplit(".", 1)[-1]
+
+
+def _resolve_output_diff_tables(
+    table_a: str,
+    table_b: str,
+    output_a: str | None,
+    output_b: str | None,
+    write_mode: str,
+) -> tuple[str, str]:
+    """Resolve the two diff-output FQNs from CLI flags + env var.
+
+    Rules:
+      1. Both ``--output-a`` and ``--output-b`` set -> use verbatim.
+      2. Exactly one set -> error (the two sides must move together).
+      3. Neither set -> read ``TABLE_CHECK_OUTPUT_DATASET`` env var
+         (form ``project.dataset``) and derive ``<env>.DIFF_<basename>``
+         per side.
+      4. Env var missing too -> error.
+
+    Additional validation:
+      - All resolved FQNs must match ``project.dataset.table`` shape.
+      - The two FQNs must differ (collision is fatal).
+      - With ``write_mode == "replace"``, both basenames must start with
+        ``DIFF_`` (safety rail against accidental clobbering of hand-named
+        tables).
+    """
+    if (output_a is None) ^ (output_b is None):
+        raise click.ClickException(
+            "--output-a and --output-b must both be set or both omitted."
+        )
+
+    if output_a is not None and output_b is not None:
+        resolved_a, resolved_b = output_a, output_b
+    else:
+        env_value = os.environ.get(ENV_OUTPUT_DATASET)
+        if not env_value:
+            raise click.ClickException(
+                "--write-diffs requires either both --output-a/--output-b or "
+                f"{ENV_OUTPUT_DATASET}=project.dataset"
+            )
+        if not _PROJECT_DATASET_RE.match(env_value):
+            raise click.ClickException(
+                f"{ENV_OUTPUT_DATASET}={env_value!r} is not a valid "
+                "'project.dataset' reference."
+            )
+        resolved_a = f"{env_value}.{TIC_OUTPUT_PREFIX}{_basename(table_a)}"
+        resolved_b = f"{env_value}.{TIC_OUTPUT_PREFIX}{_basename(table_b)}"
+
+    for fqn, side in ((resolved_a, "A"), (resolved_b, "B")):
+        if not _FQN_RE.match(fqn):
+            raise click.ClickException(
+                f"Output table for side {side} is not a valid "
+                f"'project.dataset.table' reference: {fqn!r}"
+            )
+
+    if resolved_a == resolved_b:
+        raise click.ClickException(
+            f"Output tables collide on '{resolved_a}' — "
+            "pass explicit --output-a/--output-b in distinct datasets."
+        )
+
+    if write_mode == "replace":
+        for fqn, side in ((resolved_a, "A"), (resolved_b, "B")):
+            base = _basename(fqn)
+            if not base.startswith(TIC_OUTPUT_PREFIX):
+                raise click.ClickException(
+                    f"--write-mode=replace requires output table basenames to "
+                    f"start with '{TIC_OUTPUT_PREFIX}' (got {fqn!r} for side "
+                    f"{side}). Rename the target or omit --write-mode=replace."
+                )
+
+    return resolved_a, resolved_b
 
 
 def _intersect_table_schemas(
@@ -737,6 +824,49 @@ def count(
         "(default 0.05; tighten for stricter equivalence)"
     ),
 )
+@click.option(
+    "--write-diffs",
+    is_flag=True,
+    default=False,
+    help=(
+        "Materialise two filtered copies of the source tables in BigQuery — "
+        "one per side — containing only rows that contribute to the diff "
+        "after tolerance. Output names default to DIFF_<basename> in "
+        f"${ENV_OUTPUT_DATASET}; override with --output-a/--output-b."
+    ),
+)
+@click.option(
+    "--output-a",
+    default=None,
+    help=(
+        "Fully-qualified project.dataset.table for table A's filtered diff "
+        "copy. Both --output-a and --output-b must be set together."
+    ),
+)
+@click.option(
+    "--output-b",
+    default=None,
+    help="Fully-qualified project.dataset.table for table B's filtered diff copy.",
+)
+@click.option(
+    "--write-mode",
+    default="error",
+    type=click.Choice(["error", "replace"], case_sensitive=False),
+    help=(
+        "Behaviour when diff-output tables already exist. 'error' (default) "
+        "refuses to overwrite; 'replace' overwrites but only for table names "
+        "starting with DIFF_ (TIC-generated convention)."
+    ),
+)
+@click.option(
+    "--expiration-hours",
+    default=168,
+    type=int,
+    help=(
+        "Hours until BQ auto-expires the diff-output tables. Default 168 "
+        "(one week). Pass 0 to write without an expiration."
+    ),
+)
 def summary(
     table_a: str,
     table_b: str,
@@ -755,6 +885,11 @@ def summary(
     kll_int_cols: str | None,
     kll_abs_tol: float,
     kll_rel_tol: float,
+    write_diffs: bool,
+    output_a: str | None,
+    output_b: str | None,
+    write_mode: str,
+    expiration_hours: int,
 ):
     """Generate a comprehensive comparison summary."""
     key_columns = [k.strip() for k in keys.split(",")]
@@ -798,7 +933,38 @@ def summary(
     )
     _warn_excluded_columns(builder)
 
-    pipeline_config = None if legacy else PipelineConfig(max_diff_pct=max_diff_pct / 100.0)
+    output_diff_config: OutputDiffConfig | None = None
+    if write_diffs:
+        if legacy:
+            raise click.ClickException(
+                "--write-diffs requires the pipeline path; remove --legacy."
+            )
+        resolved_a, resolved_b = _resolve_output_diff_tables(
+            table_a, table_b, output_a, output_b, write_mode
+        )
+        output_diff_config = OutputDiffConfig(
+            output_a=resolved_a,
+            output_b=resolved_b,
+            write_mode=write_mode,  # type: ignore[arg-type]
+            expiration_hours=expiration_hours,
+        )
+        click.echo(
+            f"Will write diff copies to:\n  A -> {resolved_a}\n  B -> {resolved_b}"
+        )
+    elif output_a is not None or output_b is not None:
+        click.echo(
+            "Note: --output-a / --output-b have no effect without --write-diffs.",
+            err=True,
+        )
+
+    pipeline_config = (
+        None
+        if legacy
+        else PipelineConfig(
+            max_diff_pct=max_diff_pct / 100.0,
+            output_diff=output_diff_config,
+        )
+    )
 
     mode = "legacy" if legacy else "pipeline"
     click.echo(f"Generating comparison summary ({mode} mode)...")
@@ -816,6 +982,13 @@ def summary(
     with open(json_path, "w") as f:
         json.dump(to_json_dict(result), f, indent=2, default=str)
     click.echo(f"\nSummary written to {json_path}")
+
+    if output_diff_config is not None:
+        click.echo(
+            f"Diff copies written:\n"
+            f"  A -> {output_diff_config.output_a}\n"
+            f"  B -> {output_diff_config.output_b}"
+        )
 
 
 @main.command("format")
