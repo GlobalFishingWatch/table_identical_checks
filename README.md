@@ -1,5 +1,9 @@
 # Table Identical Checks
 
+[![CI](https://github.com/GlobalFishingWatch/table_identical_checks/actions/workflows/test.yml/badge.svg)](https://github.com/GlobalFishingWatch/table_identical_checks/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
 > :warning: **Disclaimer:** This project is entirely maintained by Claude Code with high-level human supervision. Manual guidance is provided up to the following level:
 > 1. Choice of infrastructure and architecture,
 > 2. Flow of the data and checkpoints,
