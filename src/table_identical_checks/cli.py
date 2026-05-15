@@ -26,7 +26,6 @@ from .backend import (
     to_json_dict,
 )
 
-
 # Default tolerance values for filtering IEEE 754 float noise.
 # Relative handles large values; absolute handles near-zero values.
 # Combined via OR: a value is within tolerance if EITHER condition holds.

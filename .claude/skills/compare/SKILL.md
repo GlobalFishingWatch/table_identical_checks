@@ -23,11 +23,13 @@ Run `table-check summary` to compare two BigQuery tables.
 
 3. Default to `--format=table` for compact output unless the user requests verbose.
 
-4. Set `GOOGLE_CLOUD_PROJECT=world-fishing-827` as the execution project.
+4. Ensure `GOOGLE_CLOUD_PROJECT` is set to the GCP project that should bill
+   the query (e.g. `export GOOGLE_CLOUD_PROJECT=my-project`). The CLI uses
+   it via application-default credentials.
 
 5. Run the command:
 ```
-GOOGLE_CLOUD_PROJECT=world-fishing-827 venv/bin/table-check summary \
+table-check summary \
   --table-a=<table_a> --table-b=<table_b> --keys=<keys> \
   --format=table [other options]
 ```

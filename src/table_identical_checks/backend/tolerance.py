@@ -196,9 +196,15 @@ class ToleranceConfig:
         take precedence for overlapping column-specific settings.
         """
         return ToleranceConfig(
-            global_tolerance=self.global_tolerance if self.global_tolerance is not None else other.global_tolerance,
+            global_tolerance=(
+                self.global_tolerance if self.global_tolerance is not None else other.global_tolerance
+            ),
             column_tolerances={**self.column_tolerances, **other.column_tolerances},
-            global_rel_tolerance=self.global_rel_tolerance if self.global_rel_tolerance is not None else other.global_rel_tolerance,
+            global_rel_tolerance=(
+                self.global_rel_tolerance
+                if self.global_rel_tolerance is not None
+                else other.global_rel_tolerance
+            ),
             column_rel_tolerances={
                 **self.column_rel_tolerances,
                 **other.column_rel_tolerances,

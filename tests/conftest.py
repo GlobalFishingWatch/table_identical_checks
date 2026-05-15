@@ -1,13 +1,20 @@
-"""Shared test fixtures for BigQuery testing."""
+"""Shared test fixtures for BigQuery testing.
 
+The BQ-integration tests need a GCP project and a sandbox dataset where the
+test fixtures can create and delete short-lived tables. Override the
+defaults via the ``TABLE_CHECK_TEST_PROJECT`` and ``TABLE_CHECK_TEST_DATASET``
+environment variables before running ``pytest -m bq``.
+"""
+
+import os
 import uuid
 
 import pytest
 from google.cloud import bigquery
 
-# Test configuration
-TEST_PROJECT = "world-fishing-827"
-TEST_DATASET = "tech_great_expectations"
+# Test configuration -- override via env vars when running BQ tests externally.
+TEST_PROJECT = os.environ.get("TABLE_CHECK_TEST_PROJECT", "world-fishing-827")
+TEST_DATASET = os.environ.get("TABLE_CHECK_TEST_DATASET", "tech_great_expectations")
 
 # Fixtures whose presence marks a test as requiring BigQuery
 _BQ_FIXTURES = {"bq_client", "table_factory", "test_dataset"}

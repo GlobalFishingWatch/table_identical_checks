@@ -26,7 +26,7 @@ pipx install --editable /path/to/table_identical_checks
 
 ### `/compare` skill (available today)
 
-A user-scope Claude Code skill at `~/.claude/skills/compare/SKILL.md` wraps `table-check summary` with sensible defaults (table format, `GOOGLE_CLOUD_PROJECT=world-fishing-827`). It works in any project once the CLI is on `PATH` (see pipx install above).
+A user-scope Claude Code skill at `~/.claude/skills/compare/SKILL.md` wraps `table-check summary` with sensible defaults (table format, picks up the BQ execution project from the `$GOOGLE_CLOUD_PROJECT` env var). It works in any project once the CLI is on `PATH` (see pipx install above).
 
 Usage in Claude Code:
 ```
@@ -83,8 +83,8 @@ Default tolerances (abs=1e-15, rel=1e-12) apply automatically:
 
 ```
 $ table-check summary \
-    --table-a=pipe_ais_test_202408250000_published.vessel_info \
-    --table-b=pipe_ais_test_202408290000_published.vessel_info \
+    --table-a=your_project.your_dataset.vessel_info_a \
+    --table-b=your_project.your_dataset.vessel_info_b \
     --keys=vessel_id --format=table
 
 ================================================================================
@@ -219,7 +219,7 @@ pytest -m bq
 pytest -m ""
 ```
 
-211 tests across 9 test files: 123 unit tests and 88 BigQuery integration tests. BQ tests run against `world-fishing-827.tech_great_expectations`.
+309 tests across the test suite: 219 unit tests (no BQ required) and 90 BigQuery integration tests. BQ-integration tests use a sandbox dataset configurable via the `TABLE_CHECK_TEST_PROJECT` and `TABLE_CHECK_TEST_DATASET` environment variables (see `tests/conftest.py`).
 
 ## Documentation
 

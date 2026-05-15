@@ -5,7 +5,6 @@ from google.cloud import bigquery
 
 from table_identical_checks.backend import (
     ComparisonSummary,
-    PipelineConfig,
     PipelineResult,
     QueryBuilder,
     from_json_dict,
@@ -22,7 +21,6 @@ from table_identical_checks.backend.summary import (
     _reject_array_tolerance,
 )
 from table_identical_checks.backend.tolerance import ToleranceConfig
-
 
 # ---------------------------------------------------------------------------
 # Schema classification (no BigQuery)

@@ -27,7 +27,6 @@ from table_identical_checks.backend.summary import (
 from table_identical_checks.backend.tolerance import ToleranceConfig
 from table_identical_checks.cli import _parse_csv_names, main
 
-
 # ---------------------------------------------------------------------------
 # Schema classification + validation (no BigQuery)
 # ---------------------------------------------------------------------------
