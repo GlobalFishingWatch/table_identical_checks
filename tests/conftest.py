@@ -1,9 +1,10 @@
 """Shared test fixtures for BigQuery testing.
 
 The BQ-integration tests need a GCP project and a sandbox dataset where the
-test fixtures can create and delete short-lived tables. Override the
-defaults via the ``TABLE_CHECK_TEST_PROJECT`` and ``TABLE_CHECK_TEST_DATASET``
-environment variables before running ``pytest -m bq``.
+test fixtures can create and delete short-lived tables. Set these via the
+``TABLE_CHECK_TEST_PROJECT`` and ``TABLE_CHECK_TEST_DATASET`` environment
+variables before running ``pytest -m bq``; if either is unset, BQ-tagged
+tests are skipped with a clear message rather than failing loudly.
 """
 
 import os
@@ -12,9 +13,8 @@ import uuid
 import pytest
 from google.cloud import bigquery
 
-# Test configuration -- override via env vars when running BQ tests externally.
-TEST_PROJECT = os.environ.get("TABLE_CHECK_TEST_PROJECT", "world-fishing-827")
-TEST_DATASET = os.environ.get("TABLE_CHECK_TEST_DATASET", "tech_great_expectations")
+TEST_PROJECT = os.environ.get("TABLE_CHECK_TEST_PROJECT")
+TEST_DATASET = os.environ.get("TABLE_CHECK_TEST_DATASET")
 
 # Fixtures whose presence marks a test as requiring BigQuery
 _BQ_FIXTURES = {"bq_client", "table_factory", "test_dataset"}
@@ -28,15 +28,38 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(bq_marker)
 
 
+def _require_bq_env() -> None:
+    """Skip the current test if either BQ env var is unset.
+
+    Called from every fixture that touches BigQuery so unit tests
+    (which never request these fixtures) keep running cleanly.
+    """
+    missing = [
+        name
+        for name, value in (
+            ("TABLE_CHECK_TEST_PROJECT", TEST_PROJECT),
+            ("TABLE_CHECK_TEST_DATASET", TEST_DATASET),
+        )
+        if not value
+    ]
+    if missing:
+        pytest.skip(
+            f"BQ tests require {' and '.join(missing)} to be set in the "
+            "environment. See tests/conftest.py for details."
+        )
+
+
 @pytest.fixture(scope="session")
 def bq_client():
     """Create a BigQuery client using application-default credentials."""
+    _require_bq_env()
     return bigquery.Client(project=TEST_PROJECT)
 
 
 @pytest.fixture(scope="session")
 def test_dataset():
     """Return the test dataset reference."""
+    _require_bq_env()
     return f"{TEST_PROJECT}.{TEST_DATASET}"
 
 
