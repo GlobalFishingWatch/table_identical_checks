@@ -9,6 +9,7 @@ from .pipeline import (
 )
 from .query_builder import QueryBuilder
 from .schema import ColumnInfo, ColumnType, get_partition_field, get_table_schema
+from .snapshot import ResolvedSnapshotSource, resolve_snapshot_source
 from .summary import (
     ComparisonSummary,
     DimensionBucket,
@@ -36,6 +37,8 @@ __all__ = [
     "get_partition_field",
     "ColumnInfo",
     "ColumnType",
+    "ResolvedSnapshotSource",
+    "resolve_snapshot_source",
     "ComparisonSummary",
     "DuplicateInfo",
     "check_duplicates",

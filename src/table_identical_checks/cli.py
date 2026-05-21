@@ -23,6 +23,7 @@ from .backend import (
     generate_dimension_summary,
     generate_summary,
     get_table_schema,
+    resolve_snapshot_source,
     to_json_dict,
 )
 
@@ -223,6 +224,64 @@ def _warn_excluded_columns(builder: QueryBuilder) -> None:
         click.secho(f"  {col_info.name:<30} {col_info.bq_type}", fg="yellow")
     click.secho("!" * 60, fg="yellow", bold=True)
     click.echo("")
+
+
+# --- Snapshot (FOR SYSTEM_TIME / restore-deleted) resolution -------------
+
+ENV_SCRATCH_DATASET = "BQ_SCRATCH_DATASET"
+
+
+def _resolve_snapshot_sides(
+    client: bigquery.Client,
+    table_a: str,
+    table_b: str,
+    snapshot_a: str | None,
+    snapshot_b: str | None,
+    scratch_dataset: str | None,
+    expiration_hours: int = 168,
+) -> tuple[str, str, str | None, str | None]:
+    """Resolve per-side snapshot requests into ``(table_ref, snapshot_ts)`` pairs.
+
+    For each side:
+      - No snapshot requested -> pass through unchanged.
+      - Snapshot requested + table live + readable -> keep original table_ref,
+        return the timestamp so the QueryBuilder injects ``FOR SYSTEM_TIME``.
+      - Snapshot requested + table deleted (or snapshot pre-creation) ->
+        restore into ``scratch_dataset`` via the BQ ``@<millis>`` decorator,
+        return the restored ref and a None timestamp (no time-travel SQL
+        needed against the static restored copy).
+    """
+    effective_a, effective_b = table_a, table_b
+    ts_a, ts_b = None, None
+
+    def _resolve_one(ref: str, snap: str | None, side: str) -> tuple[str, str | None]:
+        if snap is None:
+            return ref, None
+        try:
+            resolved = resolve_snapshot_source(
+                client,
+                ref,
+                snap,
+                scratch_dataset=scratch_dataset,
+                expiration_hours=expiration_hours,
+            )
+        except (ValueError, RuntimeError) as e:
+            raise click.ClickException(str(e)) from e
+        if resolved.restored:
+            click.echo(
+                f"Side {side}: restored snapshot of {ref} @ {snap} into "
+                f"{resolved.table_ref}"
+            )
+        else:
+            click.echo(
+                f"Side {side}: reading {ref} at FOR SYSTEM_TIME AS OF "
+                f"{resolved.snapshot_timestamp}"
+            )
+        return resolved.table_ref, resolved.snapshot_timestamp
+
+    effective_a, ts_a = _resolve_one(table_a, snapshot_a, "A")
+    effective_b, ts_b = _resolve_one(table_b, snapshot_b, "B")
+    return effective_a, effective_b, ts_a, ts_b
 
 
 # --- Diff-split output resolution ---------------------------------------
@@ -550,6 +609,17 @@ def main():
         "(default 0.05; tighten for stricter equivalence)"
     ),
 )
+@click.option("--snapshot-a", default=None, help="ISO 8601 timestamp; read table A via BQ time travel.")
+@click.option("--snapshot-b", default=None, help="ISO 8601 timestamp; read table B via BQ time travel.")
+@click.option(
+    "--scratch-dataset",
+    default=None,
+    envvar=ENV_SCRATCH_DATASET,
+    help=(
+        "project.dataset for restoring deleted snapshot tables (or set "
+        f"${ENV_SCRATCH_DATASET})."
+    ),
+)
 def diff(
     table_a: str,
     table_b: str,
@@ -570,6 +640,9 @@ def diff(
     kll_int_cols: str | None,
     kll_abs_tol: float,
     kll_rel_tol: float,
+    snapshot_a: str | None,
+    snapshot_b: str | None,
+    scratch_dataset: str | None,
 ):
     """Compare two tables and show differences."""
     from .backend.pipeline import differing_columns, run_pipeline
@@ -585,10 +658,14 @@ def diff(
     kll_float_names = _parse_csv_names(kll_cols)
     kll_int_names = _parse_csv_names(kll_int_cols)
 
+    effective_a, effective_b, ts_a, ts_b = _resolve_snapshot_sides(
+        client, table_a, table_b, snapshot_a, snapshot_b, scratch_dataset
+    )
+
     columns = _intersect_table_schemas(
         client,
-        table_a,
-        table_b,
+        effective_a,
+        effective_b,
         key_columns,
         kll_float64_cols=kll_float_names,
         kll_int64_cols=kll_int_names,
@@ -596,7 +673,7 @@ def diff(
 
     # Get partition filters (auto-detect or use provided)
     filter_a, filter_b = get_partition_filters(
-        client, table_a, table_b, partition_filter_a, partition_filter_b
+        client, effective_a, effective_b, partition_filter_a, partition_filter_b
     )
 
     # Parse tolerance config
@@ -604,12 +681,14 @@ def diff(
 
     # Build the query builder
     builder = QueryBuilder(
-        table_a=table_a,
-        table_b=table_b,
+        table_a=effective_a,
+        table_b=effective_b,
         key_columns=key_columns,
         columns=columns,
         partition_filter_a=filter_a,
         partition_filter_b=filter_b,
+        snapshot_time_a=ts_a,
+        snapshot_time_b=ts_b,
         tolerance_config=tolerance_config,
         kll_abs_tol=kll_abs_tol,
         kll_rel_tol=kll_rel_tol,
@@ -688,6 +767,14 @@ def diff(
     default=None,
     help="Relative tolerance for floats (default: 1e-12). Pass '0' to disable. (e.g., '1e-9' or 'col1:1e-9')",
 )
+@click.option("--snapshot-a", default=None, help="ISO 8601 timestamp; read table A via BQ time travel.")
+@click.option("--snapshot-b", default=None, help="ISO 8601 timestamp; read table B via BQ time travel.")
+@click.option(
+    "--scratch-dataset",
+    default=None,
+    envvar=ENV_SCRATCH_DATASET,
+    help="project.dataset for restoring deleted snapshot tables.",
+)
 def count(
     table_a: str,
     table_b: str,
@@ -697,6 +784,9 @@ def count(
     partition_filter_b: str | None,
     tolerance: str | None,
     rel_tolerance: str | None,
+    snapshot_a: str | None,
+    snapshot_b: str | None,
+    scratch_dataset: str | None,
 ):
     """Count the number of differing rows between two tables."""
     key_columns = [k.strip() for k in keys.split(",")]
@@ -706,23 +796,29 @@ def count(
 
     client = bigquery.Client()
 
-    columns = _intersect_table_schemas(client, table_a, table_b, key_columns)
+    effective_a, effective_b, ts_a, ts_b = _resolve_snapshot_sides(
+        client, table_a, table_b, snapshot_a, snapshot_b, scratch_dataset
+    )
+
+    columns = _intersect_table_schemas(client, effective_a, effective_b, key_columns)
 
     # Get partition filters
     filter_a, filter_b = get_partition_filters(
-        client, table_a, table_b, partition_filter_a, partition_filter_b
+        client, effective_a, effective_b, partition_filter_a, partition_filter_b
     )
 
     # Parse tolerance config
     tolerance_config = _parse_tolerance(tolerance, rel_tolerance)
 
     builder = QueryBuilder(
-        table_a=table_a,
-        table_b=table_b,
+        table_a=effective_a,
+        table_b=effective_b,
         key_columns=key_columns,
         columns=columns,
         partition_filter_a=filter_a,
         partition_filter_b=filter_b,
+        snapshot_time_a=ts_a,
+        snapshot_time_b=ts_b,
         tolerance_config=tolerance_config,
     )
     _warn_excluded_columns(builder)
@@ -866,6 +962,31 @@ def count(
         "(one week). Pass 0 to write without an expiration."
     ),
 )
+@click.option(
+    "--snapshot-a",
+    default=None,
+    help=(
+        "ISO 8601 timestamp (e.g. '2026-05-08T12:00:00Z') to read table A "
+        "via BigQuery time travel. If the table is still live, injects "
+        "FOR SYSTEM_TIME AS OF; if it's been deleted, restores the snapshot "
+        "into --scratch-dataset and reads from the restored copy."
+    ),
+)
+@click.option(
+    "--snapshot-b",
+    default=None,
+    help="ISO 8601 timestamp to read table B via BigQuery time travel.",
+)
+@click.option(
+    "--scratch-dataset",
+    default=None,
+    envvar=ENV_SCRATCH_DATASET,
+    help=(
+        "project.dataset to write restored snapshot copies into when the "
+        f"original is deleted. Reads from ${ENV_SCRATCH_DATASET} if unset. "
+        "Restored tables expire after 7 days by default."
+    ),
+)
 def summary(
     table_a: str,
     table_b: str,
@@ -889,6 +1010,9 @@ def summary(
     output_b: str | None,
     write_mode: str,
     expiration_hours: int,
+    snapshot_a: str | None,
+    snapshot_b: str | None,
+    scratch_dataset: str | None,
 ):
     """Generate a comprehensive comparison summary."""
     key_columns = [k.strip() for k in keys.split(",")]
@@ -902,10 +1026,17 @@ def summary(
     kll_float_names = _parse_csv_names(kll_cols)
     kll_int_names = _parse_csv_names(kll_int_cols)
 
+    # Resolve snapshots up front: a deleted-source restore creates a new
+    # table in scratch and replaces table_a/table_b with the restored ref,
+    # so the schema intersection below sees the right schema.
+    effective_a, effective_b, ts_a, ts_b = _resolve_snapshot_sides(
+        client, table_a, table_b, snapshot_a, snapshot_b, scratch_dataset
+    )
+
     columns = _intersect_table_schemas(
         client,
-        table_a,
-        table_b,
+        effective_a,
+        effective_b,
         key_columns,
         kll_float64_cols=kll_float_names,
         kll_int64_cols=kll_int_names,
@@ -913,19 +1044,21 @@ def summary(
 
     # Get partition filters
     filter_a, filter_b = get_partition_filters(
-        client, table_a, table_b, partition_filter_a, partition_filter_b
+        client, effective_a, effective_b, partition_filter_a, partition_filter_b
     )
 
     # Parse tolerance config
     tolerance_config = _parse_tolerance(tolerance, rel_tolerance)
 
     builder = QueryBuilder(
-        table_a=table_a,
-        table_b=table_b,
+        table_a=effective_a,
+        table_b=effective_b,
         key_columns=key_columns,
         columns=columns,
         partition_filter_a=filter_a,
         partition_filter_b=filter_b,
+        snapshot_time_a=ts_a,
+        snapshot_time_b=ts_b,
         tolerance_config=tolerance_config,
         kll_abs_tol=kll_abs_tol,
         kll_rel_tol=kll_rel_tol,
@@ -1052,6 +1185,14 @@ def verify_query_cmd(input_json: str):
     default=None,
     help="Relative tolerance for floats (default: 1e-12). Pass '0' to disable. (e.g., '1e-9' or 'col1:1e-9')",
 )
+@click.option("--snapshot-a", default=None, help="ISO 8601 timestamp; read table A via BQ time travel.")
+@click.option("--snapshot-b", default=None, help="ISO 8601 timestamp; read table B via BQ time travel.")
+@click.option(
+    "--scratch-dataset",
+    default=None,
+    envvar=ENV_SCRATCH_DATASET,
+    help="project.dataset for restoring deleted snapshot tables.",
+)
 def breakdown(
     table_a: str,
     table_b: str,
@@ -1064,6 +1205,9 @@ def breakdown(
     partition_filter_b: str | None,
     tolerance: str | None,
     rel_tolerance: str | None,
+    snapshot_a: str | None,
+    snapshot_b: str | None,
+    scratch_dataset: str | None,
 ):
     """Generate comparison summary broken down by a dimension."""
     key_columns = [k.strip() for k in keys.split(",")]
@@ -1073,23 +1217,29 @@ def breakdown(
 
     client = bigquery.Client()
 
-    columns = _intersect_table_schemas(client, table_a, table_b, key_columns)
+    effective_a, effective_b, ts_a, ts_b = _resolve_snapshot_sides(
+        client, table_a, table_b, snapshot_a, snapshot_b, scratch_dataset
+    )
+
+    columns = _intersect_table_schemas(client, effective_a, effective_b, key_columns)
 
     # Get partition filters
     filter_a, filter_b = get_partition_filters(
-        client, table_a, table_b, partition_filter_a, partition_filter_b
+        client, effective_a, effective_b, partition_filter_a, partition_filter_b
     )
 
     # Parse tolerance config
     tolerance_config = _parse_tolerance(tolerance, rel_tolerance)
 
     builder = QueryBuilder(
-        table_a=table_a,
-        table_b=table_b,
+        table_a=effective_a,
+        table_b=effective_b,
         key_columns=key_columns,
         columns=columns,
         partition_filter_a=filter_a,
         partition_filter_b=filter_b,
+        snapshot_time_a=ts_a,
+        snapshot_time_b=ts_b,
         tolerance_config=tolerance_config,
     )
     _warn_excluded_columns(builder)

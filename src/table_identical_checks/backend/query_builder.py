@@ -39,6 +39,13 @@ class QueryBuilder:
     alias_b: str = "b"
     partition_filter_a: str | None = None
     partition_filter_b: str | None = None
+    # BigQuery FOR SYSTEM_TIME AS OF timestamps, applied independently per side.
+    # When set, the generated SQL reads the table at that point in time.
+    # If the original table no longer exists, the CLI layer restores the
+    # snapshot to a scratch dataset and passes the restored ref via
+    # ``table_a`` / ``table_b`` -- in that case these fields are left None.
+    snapshot_time_a: str | None = None
+    snapshot_time_b: str | None = None
     tolerance_config: ToleranceConfig | None = None
     # KLL quantile-value tolerances, applied to the extracted value at each of
     # the 5 probe quantiles (phi in [0.1, 0.25, 0.5, 0.75, 0.9]).
@@ -82,29 +89,47 @@ class QueryBuilder:
         Create SQLAlchemy table objects for both tables.
 
         Returns base selectable objects (either tables or filtered subqueries).
-        Only includes columns with supported types.
+        Only includes columns with supported types. Honours
+        ``partition_filter_*`` and ``snapshot_time_*`` on each side.
         """
-        # Define lightweight table objects with supported columns only
         supported = self._supported_columns()
-        table_a_obj = table(self.table_a, *[column(col.name) for col in supported])
-        table_b_obj = table(self.table_b, *[column(col.name) for col in supported])
+        col_list = [column(col.name) for col in supported]
+        cols_sql = ", ".join(c.name for c in supported)
 
-        # Apply partition filters if present
-        if self.partition_filter_a:
-            # Create subquery with partition filter.
-            # Use text() not literal_column(): a WHERE predicate is a SQL
-            # fragment, not a column expression.
-            filter_expr = text(self.partition_filter_a)
-            table_a_obj = select(table_a_obj).where(filter_expr).subquery(self.alias_a)
-        else:
-            table_a_obj = table_a_obj.alias(self.alias_a)
+        def build_side(
+            table_ref: str,
+            alias: str,
+            partition_filter: str | None,
+            snapshot_time: str | None,
+        ) -> Selectable:
+            # Snapshot path: SQLAlchemy can't express FOR SYSTEM_TIME directly,
+            # so wrap the FROM in a raw text() subquery and decorate it with
+            # the supported column metadata so downstream `.c.<name>` access
+            # keeps working.
+            if snapshot_time:
+                bt = self._backtick(table_ref)
+                snapshot_clause = (
+                    f" FOR SYSTEM_TIME AS OF TIMESTAMP('{snapshot_time}')"
+                )
+                where_clause = f" WHERE {partition_filter}" if partition_filter else ""
+                raw = (
+                    f"SELECT {cols_sql} FROM {bt}{snapshot_clause}{where_clause}"
+                )
+                return text(raw).columns(*col_list).subquery(alias)
 
-        if self.partition_filter_b:
-            filter_expr = text(self.partition_filter_b)
-            table_b_obj = select(table_b_obj).where(filter_expr).subquery(self.alias_b)
-        else:
-            table_b_obj = table_b_obj.alias(self.alias_b)
+            base = table(table_ref, *[column(c.name) for c in supported])
+            if partition_filter:
+                # Use text() not literal_column(): a WHERE predicate is a SQL
+                # fragment, not a column expression.
+                return select(base).where(text(partition_filter)).subquery(alias)
+            return base.alias(alias)
 
+        table_a_obj = build_side(
+            self.table_a, self.alias_a, self.partition_filter_a, self.snapshot_time_a
+        )
+        table_b_obj = build_side(
+            self.table_b, self.alias_b, self.partition_filter_b, self.snapshot_time_b
+        )
         return table_a_obj, table_b_obj
 
     def _null_safe_equal(self, col_a, col_b):
@@ -768,13 +793,35 @@ class QueryBuilder:
         """Wrap a table reference in backticks for BigQuery."""
         return f"`{table_ref}`"
 
+    def _snapshot_for(self, table_ref: str) -> str | None:
+        """Pick the snapshot timestamp that applies to a given source table ref."""
+        if table_ref == self.table_a:
+            return self.snapshot_time_a
+        if table_ref == self.table_b:
+            return self.snapshot_time_b
+        return None
+
     def _table_source(self, table_ref: str, alias: str, partition_filter: str | None) -> str:
-        """Return a FROM-clause fragment: backticked table or filtered subquery."""
-        if partition_filter:
+        """Return a FROM-clause fragment: backticked table or filtered subquery.
+
+        Honours per-side ``snapshot_time_*`` by injecting
+        ``FOR SYSTEM_TIME AS OF TIMESTAMP('<ts>')`` between the table ref
+        and the WHERE clause. The snapshot is picked from the QueryBuilder's
+        ``snapshot_time_a`` / ``snapshot_time_b`` based on the ``table_ref``
+        the caller passes (not the alias, which varies by call site).
+        """
+        snapshot_time = self._snapshot_for(table_ref)
+        bt = self._backtick(table_ref)
+        snapshot_clause = (
+            f" FOR SYSTEM_TIME AS OF TIMESTAMP('{snapshot_time}')"
+            if snapshot_time
+            else ""
+        )
+        if partition_filter or snapshot_clause:
             cols = ", ".join(c.name for c in self._supported_columns())
-            bt = self._backtick(table_ref)
-            return f"(SELECT {cols} FROM {bt} WHERE {partition_filter}) AS {alias}"
-        return f"{self._backtick(table_ref)} AS {alias}"
+            where_clause = f" WHERE {partition_filter}" if partition_filter else ""
+            return f"(SELECT {cols} FROM {bt}{snapshot_clause}{where_clause}) AS {alias}"
+        return f"{bt} AS {alias}"
 
     def _l1_null_safe_eq(self, col_name: str) -> str:
         """Generate raw SQL NULL-safe equality for Layer 1 flags."""
