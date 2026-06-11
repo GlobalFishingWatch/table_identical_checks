@@ -48,10 +48,47 @@ pytest -m bq
 
 ## Commit messages
 
-- Subject line in imperative mood, ≤ 70 chars (`Fix duplicate-key fanout
-  in diff-split outputs`).
-- Body explains the *why*, not the *what* — the diff already shows the
-  what.
+We use [Conventional Commits](https://www.conventionalcommits.org/), which
+drives our automated versioning and CHANGELOG via
+[release-please](https://github.com/googleapis/release-please).
+
+**Format:** `<type>: <imperative subject ≤ 70 chars>`
+
+| Type | Use for | Version bump (in 0.x) |
+|---|---|---|
+| `feat:` | New user-visible feature or flag | MINOR (0.2.0 → 0.3.0) |
+| `fix:` | Bug fix | PATCH (0.2.0 → 0.2.1) |
+| `perf:` | Performance change (no behaviour change) | PATCH |
+| `refactor:` | Code restructuring (no behaviour change) | none |
+| `docs:` | Documentation only | none |
+| `test:` | Test changes only | none |
+| `chore:` | Build / tooling / housekeeping | none |
+| `ci:` | CI workflow changes | none |
+| `<type>!:` | Breaking change (e.g. `feat!:`) | MAJOR (will bump 0.x → 1.0 when ready) |
+
+**Examples:**
+
+```
+feat: add --snapshot-a / --snapshot-b for BQ time-travel reads
+fix: drop world-fishing-827 fallback from BQ test config
+feat!: remove deprecated --legacy mode on summary
+docs: clarify when to use --max-diff-pct
+```
+
+The body of the commit should explain the *why*, not the *what* — the diff
+already shows the what.
+
+## How releases work
+
+You don't cut releases manually. After your PR merges to `master`, the
+release-please bot opens (or updates) a Release PR titled
+`chore(master): release X.Y.Z`. That PR bumps `pyproject.toml`'s version,
+appends a new `## [X.Y.Z]` section to `CHANGELOG.md`, and stays open until
+a maintainer merges it. Merging that PR creates the tag, the GitHub release,
+and the release notes -- in one click.
+
+If you want to know what would be in the next release at any point: look at
+the open Release PR.
 
 ## Pull requests
 

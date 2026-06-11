@@ -230,6 +230,35 @@ pytest -m ""
 - [CLI Reference](docs/cli-reference.md) -- full option tables for all commands
 - [Architecture](docs/architecture.md) -- pipeline design, STRUCT handling, module layout
 
+## Versioning
+
+This project follows [Semantic Versioning 2.0](https://semver.org/). While the
+version is `0.x`, expect minor version bumps to occasionally include breaking
+changes (per the SemVer 0.x convention). Once the CLI surface stabilises a
+`1.0.0` release will commit to backward compatibility within the major.
+
+**What counts as the public API:**
+
+- CLI flags and their semantics across all commands.
+- The JSON cache schema (`~/.cache/table-check/<hash>.json`) consumed by
+  `format` and `verify-query`.
+- The schema of the output tables produced by `summary --write-diffs` and
+  `diff --output-table`.
+
+**Not part of the public API:**
+
+- Internal Python imports under `table_identical_checks.backend`. Use the
+  CLI instead.
+- Exact output text formatting (`--format=verbose` and `--format=table`) --
+  parsable output goes through the JSON cache.
+- BigQuery cost / query-shape characteristics.
+
+Releases are managed via
+[release-please](https://github.com/googleapis/release-please): merge regular
+PRs to `master` with [Conventional Commits](https://www.conventionalcommits.org/)
+prefixes, and release-please opens (and keeps updating) a Release PR with the
+next version bump and CHANGELOG entries. Merge that PR to ship.
+
 ## Limitations
 
 - No JSON/CSV export (stdout only, unless using `--output-table` on `diff`)
