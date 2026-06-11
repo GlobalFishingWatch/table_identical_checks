@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] -- 2026-06-12
+
+### Added
+
+- **Per-side BigQuery snapshot reads**: all four commands (`summary`, `diff`,
+  `count`, `breakdown`) now accept `--snapshot-a` / `--snapshot-b` ISO 8601
+  timestamps. When the source table is still live, the generated SQL wraps
+  reads in `FOR SYSTEM_TIME AS OF TIMESTAMP('…')`. When the source has been
+  deleted, the resolver restores the snapshot via BigQuery's `<table>@<millis>`
+  time-travel decorator into a scratch dataset (set via `--scratch-dataset`
+  or the `BQ_SCRATCH_DATASET` env var) and reads from the restored copy.
+  Restored tables use a deterministic name (`_RESTORED_<basename>_<ts>`) so
+  re-runs reuse the same materialised copy, and default to a 7-day expiration.
+
 ## [0.1.0] -- 2026-05-15
 
 Initial public release.
@@ -62,5 +76,6 @@ Initial public release.
   `KLL_QUANTILES.EXTRACT_POINT_*`, etc.). Cross-engine support is not in
   scope for 0.1.0.
 
-[Unreleased]: https://github.com/GlobalFishingWatch/table_identical_checks/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/GlobalFishingWatch/table_identical_checks/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/GlobalFishingWatch/table_identical_checks/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/GlobalFishingWatch/table_identical_checks/releases/tag/v0.1.0
