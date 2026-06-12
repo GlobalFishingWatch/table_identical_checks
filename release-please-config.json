@@ -10,7 +10,7 @@
     { "type": "perf", "section": "Changed", "hidden": false },
     { "type": "refactor", "section": "Changed", "hidden": false },
     { "type": "revert", "section": "Reverted", "hidden": false },
-    { "type": "docs", "section": "Documentation", "hidden": false },
+    { "type": "docs", "section": "Documentation", "hidden": true },
     { "type": "build", "section": "Build", "hidden": true },
     { "type": "ci", "section": "CI/CD", "hidden": true },
     { "type": "chore", "section": "Chores", "hidden": true },
