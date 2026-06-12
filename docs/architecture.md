@@ -79,6 +79,80 @@ The pipeline SQL uses `_safe_alias()` to mangle dot-notation into double-undersc
 
 REPEATED STRUCTs and REPEATED sub-fields inside a non-repeated STRUCT are marked UNSUPPORTED and auto-excluded.
 
+## Schema Intersection
+
+The CLI never assumes the two inputs share an identical schema. Before
+constructing the `QueryBuilder`, `_intersect_table_schemas()` in `cli.py`:
+
+1. Fetches schemas for both tables independently.
+2. Intersects on `(column_name, ColumnType, bq_type)`. Columns that appear on
+   only one side, or appear on both with different types, are dropped.
+3. Reports the dropped columns to stderr with their reason
+   (`only in A`, `only in B`, or `type diff`).
+4. Hard-errors if any **key column** is missing from either side.
+
+The surviving column list (from A's schema, KLL reclassification already
+applied) is what the pipeline compares. This means a comparison can run
+sensibly even when the two tables have drifted apart, without silently
+treating columns-only-on-one-side as differences.
+
+## Snapshot Resolution
+
+`--snapshot-a` / `--snapshot-b` route through `backend/snapshot.py`. The
+resolver inspects each side independently and picks one of two paths:
+
+### Path 1: Live table + readable snapshot
+
+The current table exists and a dry-run `SELECT 1 FROM <ref> FOR SYSTEM_TIME AS OF`
+succeeds. The resolver returns a `ResolvedSnapshotSource` with
+`snapshot_timestamp` set and `restored = False`. The QueryBuilder injects
+`FOR SYSTEM_TIME AS OF TIMESTAMP('<ts>')` into the generated SQL via
+`_table_source()` (raw-SQL path) and `_create_table_objects()` (SQLAlchemy
+path). No side effects.
+
+### Path 2: Deleted table → restore-via-copy
+
+`FOR SYSTEM_TIME AS OF` only works against currently-existing tables. When
+the source has been deleted (or the snapshot pre-dates its creation), the
+resolver invokes the BigQuery `<table>@<millis>` time-travel decorator
+via `client.copy_table(...)` to materialise the snapshot into a scratch
+dataset:
+
+```
+<scratch_dataset>._RESTORED_<basename>_<YYYYMMDDHHMMSS>
+```
+
+The restored table gets an `expires` timestamp (default 7 days) so it
+self-cleans. Subsequent reads target the restored copy as a normal table;
+no time-travel SQL is needed. The deterministic name means re-runs against
+the same source + snapshot reuse the materialised copy instead of copying
+again.
+
+The CLI scratch dataset is set via `--scratch-dataset` or
+`$BQ_SCRATCH_DATASET`. The resolver raises if Path 2 is needed but no
+scratch dataset is configured.
+
+## `--write-diffs` Materialisation
+
+When `summary --write-diffs` is set, the pipeline script appends two
+`CREATE TABLE` statements per side. The key implementation details:
+
+- The CREATE TABLE statements are emitted **inside both branches** of the
+  circuit-breaker IF/ELSE. The aborted branch can still materialise the diff
+  copies because `_l1` alone is enough to decide which rows participate in
+  the diff.
+- The filter uses `WHERE EXISTS (SELECT 1 FROM _l1 WHERE <key match> AND ...)`,
+  not a JOIN. This prevents fan-out when the source has duplicate keys (a
+  JOIN against `_l1` would multiply source rows by the number of L1 rows
+  per key).
+- The CREATE TABLE statements run **before** the final `SELECT` in their
+  branch. BigQuery returns the result of the last `SELECT` to the client; if
+  DDL were emitted after the summary `SELECT`, the empty DDL result would
+  mask the summary row.
+- When tolerance is configured, an extra `row_within_tolerance` flag is
+  lifted into `_l1` so the diff filter can exclude rows that landed in L1
+  only because of within-tolerance numeric drift.
+
 ## Module Layout
 
 ```
@@ -86,9 +160,14 @@ src/table_identical_checks/
   backend/
     __init__.py          # Public API exports
     query_builder.py     # SQL generation (SQLAlchemy + raw SQL for pipeline)
-    pipeline.py          # PipelineConfig, PipelineResult, run_pipeline(), differing_columns()
+    pipeline.py          # PipelineConfig, OutputDiffConfig, PipelineResult,
+                         # run_pipeline(), differing_columns()
     summary.py           # ComparisonSummary, formatters, generate_summary()
-    schema.py            # Column type detection, partition field detection, STRUCT flattening
+    schema.py            # Column type detection, partition field detection,
+                         # STRUCT flattening
+    snapshot.py          # ResolvedSnapshotSource, resolve_snapshot_source(),
+                         # restore-via-copy for deleted tables
     tolerance.py         # ToleranceConfig parsing
-  cli.py                 # Click CLI (diff, count, summary, breakdown)
+  cli.py                 # Click CLI: summary, diff, count, breakdown,
+                         # format, verify-query
 ```

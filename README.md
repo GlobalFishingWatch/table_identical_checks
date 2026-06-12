@@ -76,6 +76,30 @@ table-check diff ... --only-diffs
 
 # Dry run (print generated SQL only)
 table-check diff ... --dry-run
+
+# Materialise filtered diff copies of both inputs to BQ
+TABLE_CHECK_OUTPUT_DATASET=project.scratch_dataset \
+  table-check summary ... --write-diffs --write-mode=replace
+
+# Read each side via BigQuery time travel (deleted tables auto-restore
+# into BQ_SCRATCH_DATASET via the @<millis> decorator)
+BQ_SCRATCH_DATASET=project.scratch_dataset \
+  table-check summary ... --snapshot-a=2026-05-08T12:00:00Z --snapshot-b=2026-05-08T12:00:00Z
+```
+
+### Companion commands
+
+Every `summary` invocation writes its result to a deterministic JSON path under
+`$XDG_CACHE_HOME/table-check/` (typically `~/.cache/table-check/`), so follow-up
+commands can re-render or verify without re-running BigQuery:
+
+```bash
+# Re-render a saved summary in another format
+table-check format --input-json=<path> --format=table
+
+# Emit an EXCEPT DISTINCT / UNION ALL verification query for the columns
+# the comparison found equal (pre-tolerance)
+table-check verify-query --input-json=<path>
 ```
 
 See [docs/cli-reference.md](docs/cli-reference.md) for full option details.
@@ -123,8 +147,11 @@ not these real differences (max relative delta 2.1e-04 far exceeds 1e-12).
 - **Automatic partition filter detection** via dry-run queries (works for views over partitioned tables)
 - **STRUCT flattening**: Non-repeated STRUCT/RECORD fields are recursively flattened to dot-notation sub-fields
 - **Unsupported column auto-exclusion**: ARRAY, JSON, BYTES, etc. are excluded with a warning
-- **Diff persistence** (`--output-table`): Write results to a BQ table with optional TTL
+- **Diff persistence** (`--output-table` on `diff`): Write the row-level diff to a BQ table with optional TTL
+- **Per-side filtered copies** (`--write-diffs` on `summary`): Materialise two BQ tables, one per input, each containing only the rows that contribute to the diff after tolerance. Output names default to `DIFF_<basename>` in `$TABLE_CHECK_OUTPUT_DATASET`
+- **BigQuery time travel** (`--snapshot-a` / `--snapshot-b`): Read either side at a past timestamp via `FOR SYSTEM_TIME AS OF`. If the source has been deleted (within the 7-day time-travel window), the snapshot is restored into `$BQ_SCRATCH_DATASET` via the `<table>@<millis>` decorator and compared from there
 - **Focused diffs** (`--only-diffs`): Restrict output to columns with actual differences
+- **Schema intersection**: When the two inputs don't share an identical schema, only common columns are compared. Missing / type-mismatched columns are reported as a yellow warning. Key columns must be present on both sides (hard error otherwise)
 - NULL-safe comparison (NULLs treated as equal)
 
 ### Supported Column Types
@@ -199,10 +226,6 @@ sketches and checking absolute and relative tolerances on the extracted
 values (BigQuery does not provide a rank-from-value function for KLL
 sketches).
 
-See [`TABLE_IDENTICAL_CHECKS_QA_KLL.md`](TABLE_IDENTICAL_CHECKS_QA_KLL.md) for
-a worked example on the `segments_daily` `speed_sketch` column, including
-both comparison strategies, concrete tolerance choices, and edge cases.
-
 ### Future: `--custom-eq` escape hatch
 
 A future `--custom-eq "col:<sql>"` flag (on the roadmap, not yet implemented)
@@ -261,9 +284,9 @@ next version bump and CHANGELOG entries. Merge that PR to ship.
 
 ## Limitations
 
-- No JSON/CSV export (stdout only, unless using `--output-table` on `diff`)
-- No schema validation (assumes identical schemas)
+- Stdout-only output (unless using `--output-table` on `diff` or `--write-diffs` on `summary`)
 - Key columns must be specified manually
 - Pipeline mode only available for `summary`; other commands use the SQLAlchemy query path
+- Schema differences between the two tables are handled gracefully (common columns are compared; mismatches are warned about and excluded from the comparison) but the tool does not validate or enforce a target schema
 - Nested arrays and arrays containing STRUCT fields that themselves contain STRUCT/REPEATED/BYTES/JSON/RANGE are auto-excluded. `ARRAY<scalar>` and `ARRAY<STRUCT<scalars>>` are supported via multiset equality.
 - `BYTES`, `JSON`, and `RANGE` columns are auto-excluded. See "Comparing unsupported columns" above for semantic-comparison guidance (e.g. KLL sketches).
