@@ -1,0 +1,77 @@
+name: Bug report
+description: Report a bug or unexpected behaviour in table-check.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Please redact any
+        sensitive table identifiers (project IDs, internal dataset names)
+        before submitting.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What were you trying to do?
+      placeholder: |
+        Brief description of the issue and what you expected vs. what occurred.
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command run
+      description: The exact `table-check` invocation. Replace real table names with placeholders if needed.
+      render: shell
+      placeholder: |
+        table-check summary \
+          --table-a=proj.ds.table_a \
+          --table-b=proj.ds.table_b \
+          --keys=id
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual output / error
+      description: Paste the relevant CLI output, traceback, or BigQuery error message.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What did you expect to see instead?
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: table-check version
+      description: Output of `pipx list` or `pip show table-identical-checks` (Version line).
+      placeholder: "0.2.0"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python --version`.
+      placeholder: "Python 3.12.3"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else relevant — schema shape, table sizes, partitioning, snapshot timestamps, etc.
+    validations:
+      required: false

@@ -1,0 +1,45 @@
+name: Feature request
+description: Suggest a new feature or improvement for table-check.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: skim the README and docs/cli-reference.md to confirm
+        the behaviour you want isn't already supported. For substantive
+        design proposals, an issue is the right venue to discuss before
+        opening a PR.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What's the use case or pain point? A concrete scenario you ran into helps more than an abstract description.
+      placeholder: |
+        "When comparing two snapshots of <X>, I needed to <Y>, but..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: A specific CLI flag, behaviour change, or output format you'd like to see. If you've thought about the SQL shape or implementation, share that too.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds do you currently use? Are there existing flags that get you close?
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else relevant — links to similar features in other tools, scale considerations, etc.
+    validations:
+      required: false
