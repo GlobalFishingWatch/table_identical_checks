@@ -16,8 +16,9 @@ updates:
       include: scope
     groups:
       actions:
-        patterns:
-          - "*"
+        update-types:
+          - patch
+          - minor
 
   # Python deps. Patch / minor bumps grouped so we don't drown in PRs;
   # majors land separately so they get individual review.
