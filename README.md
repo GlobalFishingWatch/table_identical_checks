@@ -250,6 +250,7 @@ pytest -m ""
 
 ## Documentation
 
+- [Recipes](docs/recipes.md) -- worked end-to-end examples for common comparison workflows
 - [CLI Reference](docs/cli-reference.md) -- full option tables for all commands
 - [Architecture](docs/architecture.md) -- pipeline design, STRUCT handling, module layout
 
