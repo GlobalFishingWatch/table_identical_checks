@@ -1,0 +1,39 @@
+version: 2
+updates:
+  # Keep pinned GitHub Actions up to date. With SHA-pinned actions,
+  # Dependabot opens a PR per version bump showing the SHA diff and the
+  # action's release notes; review the diff, merge if happy.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Python deps. Patch / minor bumps grouped so we don't drown in PRs;
+  # majors land separately so they get individual review.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      python-patch-and-minor:
+        update-types:
+          - patch
+          - minor
