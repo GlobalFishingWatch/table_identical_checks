@@ -5,6 +5,13 @@ All notable changes to `table-identical-checks` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0](https://github.com/GlobalFishingWatch/table_identical_checks/compare/v0.2.1...v0.3.0) (2026-08-11)
+
+
+### Added
+
+* interactive prompts for summary's common parameters ([559dbae](https://github.com/GlobalFishingWatch/table_identical_checks/commit/559dbaecadee3c92662251bcbd311d6d09e94b54))
+
 ## [0.2.1](https://github.com/GlobalFishingWatch/table_identical_checks/compare/v0.2.0...v0.2.1) (2026-06-12)
 
 
