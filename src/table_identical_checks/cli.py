@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 from datetime import datetime, timezone
 from typing import Sequence
 
@@ -224,6 +225,88 @@ def _warn_excluded_columns(builder: QueryBuilder) -> None:
         click.secho(f"  {col_info.name:<30} {col_info.bq_type}", fg="yellow")
     click.secho("!" * 60, fg="yellow", bold=True)
     click.echo("")
+
+
+# --- Interactive prompting for the summary command ----------------------
+
+
+def _prompt_common_params(
+    table_a: str | None,
+    table_b: str | None,
+    keys: str | None,
+    tolerance: str | None,
+    rel_tolerance: str | None,
+    output_format: str,
+    force_interactive: bool,
+) -> tuple[str, str, str, str | None, str | None, str]:
+    """Prompt for the five most common ``summary`` parameters when appropriate.
+
+    Interactive mode is entered when either:
+      - ``force_interactive`` is True (``--interactive`` / ``-i`` flag), or
+      - stdin is a TTY and any required arg (``table-a``, ``table-b``,
+        ``keys``) is missing.
+
+    In non-TTY contexts with missing required args, this raises the same
+    ``click.UsageError`` a non-interactive user would see. Values passed on
+    the command line are shown as the prompt defaults so hitting Enter
+    accepts them.
+    """
+    missing_required = not (table_a and table_b and keys)
+    is_tty = sys.stdin.isatty()
+
+    if not force_interactive and not missing_required:
+        return table_a, table_b, keys, tolerance, rel_tolerance, output_format  # type: ignore[return-value]
+
+    if missing_required and not is_tty:
+        # Preserve the pre-existing "required flag missing" error shape for
+        # scripts / CI. Message matches Click's usage-error style.
+        missing = [
+            name
+            for name, value in (("--table-a", table_a), ("--table-b", table_b), ("--keys", keys))
+            if not value
+        ]
+        raise click.UsageError(
+            f"Missing option(s): {', '.join(missing)}. "
+            "Pass them on the command line or run in an interactive terminal."
+        )
+
+    click.secho("Interactive mode. Press Ctrl+C to abort.", fg="cyan")
+    click.echo("")
+
+    def _ask_with_default(label: str, current: str | None) -> str:
+        if current:
+            return click.prompt(label, default=current, show_default=True)
+        return click.prompt(label)
+
+    if force_interactive:
+        # Explicit -i: prompt for all five, showing existing values as defaults.
+        table_a = _ask_with_default("Table A (project.dataset.table)", table_a)
+        table_b = _ask_with_default("Table B (project.dataset.table)", table_b)
+        keys = _ask_with_default("Key columns (comma-separated)", keys)
+        tolerance = click.prompt(
+            "Absolute tolerance (blank for default 1e-15)",
+            default=tolerance or "",
+            show_default=False,
+        ) or None
+        output_format = click.prompt(
+            "Output format",
+            type=click.Choice(["verbose", "table"], case_sensitive=False),
+            default=output_format,
+            show_default=True,
+        )
+    else:
+        # Auto-triggered: only prompt for the missing required flags. Tolerance
+        # and format use their defaults (or whatever the user passed). Anyone
+        # who explicitly wants to revise those runs with -i.
+        if not table_a:
+            table_a = click.prompt("Table A (project.dataset.table)")
+        if not table_b:
+            table_b = click.prompt("Table B (project.dataset.table)")
+        if not keys:
+            keys = click.prompt("Key columns (comma-separated)")
+
+    click.echo("")
+    return table_a, table_b, keys, tolerance, rel_tolerance, output_format
 
 
 # --- Snapshot (FOR SYSTEM_TIME / restore-deleted) resolution -------------
@@ -834,9 +917,20 @@ def count(
 
 
 @main.command()
-@click.option("--table-a", required=True, help="First table (project.dataset.table)")
-@click.option("--table-b", required=True, help="Second table (project.dataset.table)")
-@click.option("--keys", required=True, help="Comma-separated key columns for joining")
+@click.option("--table-a", default=None, help="First table (project.dataset.table)")
+@click.option("--table-b", default=None, help="Second table (project.dataset.table)")
+@click.option("--keys", default=None, help="Comma-separated key columns for joining")
+@click.option(
+    "--interactive",
+    "-i",
+    is_flag=True,
+    default=False,
+    help=(
+        "Prompt for the common parameters (table-a, table-b, keys, tolerance, "
+        "format) interactively. Auto-enabled on a TTY when any required arg "
+        "is missing; pass -i to force it even when all three are set."
+    ),
+)
 @click.option("--credentials", envvar="GOOGLE_APPLICATION_CREDENTIALS", help="Path to SA JSON")
 @click.option("--partition-filter-a", default=None, help="Partition filter for table A")
 @click.option("--partition-filter-b", default=None, help="Partition filter for table B")
@@ -988,9 +1082,10 @@ def count(
     ),
 )
 def summary(
-    table_a: str,
-    table_b: str,
-    keys: str,
+    table_a: str | None,
+    table_b: str | None,
+    keys: str | None,
+    interactive: bool,
     credentials: str,
     partition_filter_a: str | None,
     partition_filter_b: str | None,
@@ -1015,6 +1110,14 @@ def summary(
     scratch_dataset: str | None,
 ):
     """Generate a comprehensive comparison summary."""
+    # Interactive mode fills in the five most common params (table-a, table-b,
+    # keys, tolerance, format) when a TTY user runs the command with any
+    # required arg missing, or when they explicitly pass --interactive / -i.
+    # Non-TTY invocations with missing required args still fail loudly.
+    table_a, table_b, keys, tolerance, rel_tolerance, output_format = _prompt_common_params(
+        table_a, table_b, keys, tolerance, rel_tolerance, output_format, interactive
+    )
+
     key_columns = [k.strip() for k in keys.split(",")]
 
     if credentials:

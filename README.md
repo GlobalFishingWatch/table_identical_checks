@@ -45,6 +45,12 @@ A native MCP server wrapping the same CLI (`summary`, `format`, `verify-query`, 
 ## Quick Start
 
 ```bash
+# Interactive mode: run `summary` with no args on a TTY and it prompts for
+# --table-a, --table-b and --keys. Pass -i / --interactive to also be
+# prompted for tolerance and format, using any flags you did pass as
+# defaults.
+table-check summary
+
 # Summary with compact table output (recommended starting point)
 table-check summary --table-a=project.dataset.table1 --table-b=project.dataset.table2 \
   --keys=id --format=table
