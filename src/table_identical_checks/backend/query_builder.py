@@ -1141,7 +1141,8 @@ class QueryBuilder:
           1. Counts rows in each table (cheap, no join)
           2. Layer 1: Identifies non-identical rows with per-column equality flags
           3. Circuit breaker: aborts if diff % exceeds threshold
-          4. Layer 2: Computes all deltas for non-identical rows (INNER JOIN)
+          4. Layer 2: Computes all deltas for non-identical matched pairs,
+             from the per-side values Layer 1 carried (no re-join on the key)
           5. Layer 3: Aggregates all statistics into a single output row
 
         When ``output_diff`` (an :class:`OutputDiffConfig`) is set, the script
@@ -1207,6 +1208,20 @@ class QueryBuilder:
                 eq_expr = self._l1_null_safe_eq(col.name)
             eq_alias = self._safe_alias(f"{col.name}__eq")
             l1_select_parts.append(f"  {eq_expr} AS {eq_alias}")
+
+        # Carry each side's values for matched pairs so Layer 2 computes its
+        # deltas from the pair Layer 1 actually compared. Re-joining the
+        # sources on the key instead would pair every row of a duplicated key
+        # with every other one (n^2 rows, mispaired deltas). STRUCT fields
+        # are carried via their top-level column so ``a.info.score`` resolves.
+        row_fields = list(dict.fromkeys(c.name.split(".", 1)[0] for c in value_cols))
+        if row_fields:
+            matched = f"a.{first_key} IS NOT NULL AND b.{first_key} IS NOT NULL"
+            for side in ("a", "b"):
+                fields = ", ".join(f"{side}.{f} AS `{f}`" for f in row_fields)
+                l1_select_parts.append(
+                    f"  IF({matched}, STRUCT({fields}), NULL) AS {side}_row"
+                )
 
         # Optional: row-level "passes tolerance" flag used by --write-diffs to
         # decide which matched rows belong in the per-side diff outputs.
@@ -1387,19 +1402,23 @@ class QueryBuilder:
 
         l2_select = ",\n".join(l2_select_parts)
 
-        # Layer 2 joins non-identical rows back to source tables (INNER JOIN)
-        l2_join_a = " AND ".join(f"l1.{k} = a.{k}" for k in self.key_columns)
-        l2_join_b = " AND ".join(f"l1.{k} = b.{k}" for k in self.key_columns)
+        # Layer 2 reads the value pairs carried in _l1 (no re-join, no second
+        # scan of the sources). UNNEST of a one-element array exposes each
+        # side's struct under the alias a / b, so the expressions above that
+        # reference ``a.<col>`` / ``b.<col>`` resolve unchanged.
+        l2_rows = (
+            "CROSS JOIN UNNEST([l1.a_row]) AS a\n"
+            "CROSS JOIN UNNEST([l1.b_row]) AS b\n"
+            if row_fields
+            else ""
+        )
 
         l2_stmt = (
             "CREATE TEMP TABLE _l2 AS\n"
             "SELECT\n"
             f"{l2_select}\n"
             "FROM _l1 l1\n"
-            f"JOIN {source_a_join}\n"
-            f"  ON {l2_join_a}\n"
-            f"JOIN {source_b_join}\n"
-            f"  ON {l2_join_b}\n"
+            f"{l2_rows}"
             "WHERE l1.in_a AND l1.in_b;\n"
         )
 

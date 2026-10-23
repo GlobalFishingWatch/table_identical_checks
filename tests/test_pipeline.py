@@ -4,6 +4,8 @@ import pytest
 from google.cloud import bigquery
 
 from table_identical_checks.backend import (
+    ColumnInfo,
+    ColumnType,
     PipelineConfig,
     QueryBuilder,
     generate_summary,
@@ -631,3 +633,132 @@ class TestPipelineGeography:
         # The small shift should be within 1000m tolerance
         assert "within_tolerance_count" in geo_stats
         assert "outside_tolerance_count" in geo_stats
+
+
+# ---------------------------------------------------------------------------
+# Duplicate keys
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineDuplicateKeys:
+    """Layer 2 must use the pairs Layer 1 compared, not re-pair on the key.
+
+    Re-joining _l1 to the sources on the key alone produced up to n^2 rows
+    per duplicated key: post-tolerance counts exceeded pre-tolerance ones,
+    rows_identical went negative and deltas were computed on mispaired rows.
+    """
+
+    def test_layer2_does_not_rejoin_sources(self):
+        builder = QueryBuilder(
+            table_a="p.d.a",
+            table_b="p.d.b",
+            key_columns=["id"],
+            columns=[
+                ColumnInfo("id", "INT64", ColumnType.INTEGER),
+                ColumnInfo("val", "FLOAT64", ColumnType.FLOAT),
+                ColumnInfo("info.score", "FLOAT64", ColumnType.FLOAT),
+                ColumnInfo("info.label", "STRING", ColumnType.STRING),
+            ],
+        )
+        script = builder.build_pipeline_script()
+        l2 = script[script.index("CREATE TEMP TABLE _l2") :].split(";", 1)[0]
+
+        assert "p.d.a" not in l2
+        assert "p.d.b" not in l2
+        assert "CROSS JOIN UNNEST([l1.a_row]) AS a" in l2
+        assert "CROSS JOIN UNNEST([l1.b_row]) AS b" in l2
+        # STRUCT fields are carried once, via their top-level column
+        assert "STRUCT(a.val AS `val`, a.info AS `info`)" in script
+        assert "STRUCT(b.val AS `val`, b.info AS `info`)" in script
+
+    def _builder(self, bq_client, table_factory, rows_a, rows_b):
+        table_a = table_factory(NUMERIC_SCHEMA, rows_a)
+        table_b = table_factory(NUMERIC_SCHEMA, rows_b)
+        columns = get_table_schema(bq_client, table_a)
+        return QueryBuilder(
+            table_a=table_a,
+            table_b=table_b,
+            key_columns=["id"],
+            columns=columns,
+            tolerance_config=ToleranceConfig(global_tolerance=1e-9),
+        )
+
+    def test_post_tolerance_not_inflated(self, bq_client, table_factory):
+        """Both pairs of the duplicated key differ (the original bug report)."""
+        builder = self._builder(
+            bq_client,
+            table_factory,
+            rows_a=[
+                {"id": 1, "int_val": 10, "float_val": 1.0},
+                {"id": 1, "int_val": 10, "float_val": 2.0},
+                {"id": 2, "int_val": 10, "float_val": 5.0},
+            ],
+            rows_b=[
+                {"id": 1, "int_val": 10, "float_val": 3.0},
+                {"id": 2, "int_val": 10, "float_val": 5.0},
+            ],
+        )
+        summary = generate_summary(
+            bq_client, builder, pipeline_config=PipelineConfig(max_diff_pct=1.0)
+        )
+
+        assert summary.rows_in_both_with_differences_pretolerance == 2
+        assert summary.rows_in_both_with_differences == 2
+        assert summary.rows_identical == 1
+        stats = summary.numeric_column_stats["float_val"]
+        assert stats["within_tolerance_count"] == 0
+        assert stats["outside_tolerance_count"] == 2
+        assert summary.column_diff_counts["float_val"] == 2
+
+    def test_deltas_use_compared_pair(self, bq_client, table_factory):
+        """Only one row of key 1 differs; its identical twin must not be paired in."""
+        builder = self._builder(
+            bq_client,
+            table_factory,
+            rows_a=[
+                {"id": 1, "int_val": 10, "float_val": 1.0},
+                {"id": 1, "int_val": 20, "float_val": 2.0},
+            ],
+            rows_b=[{"id": 1, "int_val": 10, "float_val": 1.0}],
+        )
+        result = run_pipeline(bq_client, builder, PipelineConfig(max_diff_pct=1.0))
+
+        assert result.rows_in_both_with_differences == 1
+        assert result.total_differing_rows == 1
+        assert result.post_tolerance_diff_count == 1
+        # The re-join averaged in the twin's zero delta (5 instead of 10)
+        assert result.numeric_column_stats["int_val"]["avg_abs_delta"] == 10
+        assert result.numeric_column_stats["float_val"]["within_tolerance_count"] == 0
+
+    def test_duplicates_on_both_sides(self, bq_client, table_factory):
+        """2x2 rows for key 1: one equal pair, three differing pairs.
+
+        Keys 2 and 3 are identical padding: 3 differing pairs would exceed
+        the 2 rows per table and trip the circuit breaker even at 100%.
+        """
+        padding = [
+            {"id": 2, "int_val": 10, "float_val": 5.0},
+            {"id": 3, "int_val": 10, "float_val": 5.0},
+        ]
+        builder = self._builder(
+            bq_client,
+            table_factory,
+            rows_a=[
+                {"id": 1, "int_val": 10, "float_val": 1.0},
+                {"id": 1, "int_val": 10, "float_val": 2.0},
+                *padding,
+            ],
+            rows_b=[
+                {"id": 1, "int_val": 10, "float_val": 1.0},
+                {"id": 1, "int_val": 10, "float_val": 3.0},
+                *padding,
+            ],
+        )
+        result = run_pipeline(bq_client, builder, PipelineConfig(max_diff_pct=1.0))
+
+        assert result.rows_in_both_with_differences == 3
+        assert result.total_differing_rows == 3
+        assert result.post_tolerance_diff_count == 3
+        stats = result.numeric_column_stats["float_val"]
+        assert stats["within_tolerance_count"] + stats["outside_tolerance_count"] == 3
+        assert stats["max_abs_delta"] == 2.0

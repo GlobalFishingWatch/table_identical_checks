@@ -12,7 +12,8 @@ SET total_rows_b = COUNT(*) FROM table_b
 
 --- Layer 1: Identify non-identical rows ---
 CREATE TEMP TABLE _l1 AS
-  SELECT keys, in_a, in_b, col1__eq, col2__eq, ...
+  SELECT keys, in_a, in_b, col1__eq, col2__eq, ...,
+         a_row, b_row   -- STRUCT of each side's values, matched pairs only
   FROM table_a FULL OUTER JOIN table_b ON keys
   WHERE any column differs OR row only in one table
 
@@ -26,8 +27,8 @@ ELSE
   CREATE TEMP TABLE _l2 AS
     SELECT deltas, tolerance flags, ...
     FROM _l1
-    JOIN table_a ON keys   -- INNER JOIN: only non-identical rows
-    JOIN table_b ON keys
+    CROSS JOIN UNNEST([a_row]) AS a   -- re-exposes the pair Layer 1 compared
+    CROSS JOIN UNNEST([b_row]) AS b
     WHERE in_a AND in_b
 
   --- Layer 3: Aggregate statistics ---
@@ -40,7 +41,7 @@ Key design points:
 
 - **Single BQ job**: The entire pipeline runs as one `client.query(script)` call
 - **Temp tables**: `_l1` and `_l2` are `CREATE TEMP TABLE` -- automatically scoped to the script, no cleanup needed
-- **Layer 2 uses INNER JOIN**: Since Layer 1 identified which keys differ, Layer 2 only re-reads those rows (~10% of data in typical comparisons)
+- **Layer 2 reads only `_l1`**: Layer 1 carries both sides' values for each differing matched pair, so Layer 2 computes deltas without touching the source tables again. Re-joining the sources on the key would pair every row of a duplicated key with every other one (up to n² rows), inflating post-tolerance counts and mispairing deltas. It would also re-scan both tables.
 - **Circuit breaker**: Controlled by `--max-diff-pct` (default: 10%). If too many rows differ, returns Layer 1 counts only with `pipeline_status = 'ABORTED'`
 - **Identical column detection**: Layer 1 per-column `diff_count` identifies columns that are exactly identical; these are excluded from Layer 2/3 stats and listed separately in output
 
