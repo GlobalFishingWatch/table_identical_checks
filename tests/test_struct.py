@@ -609,3 +609,74 @@ class TestSafeAlias:
     def test_nested_dot_name_mangled(self):
         """Multi-level dot-notation names should have all dots replaced."""
         assert QueryBuilder._safe_alias("outer.inner.x__eq") == "outer__inner__x__eq"
+
+
+# ---------------------------------------------------------------------------
+# Struct columns inside wrapped (filtered / snapshot) source subqueries
+# ---------------------------------------------------------------------------
+
+
+def _struct_columns():
+    return _flatten_fields(MIXED_SCHEMA)
+
+
+class TestStructInWrappedSource:
+    """Wrapped sources must project the top-level struct, not its leaf paths.
+
+    Selecting ``info.score`` in a subquery names the output column ``score``,
+    so the outer query's ``b.info.score`` would fail with
+    "Name info not found inside b".
+    """
+
+    def test_projection_dedupes_struct_to_top_level(self):
+        builder = QueryBuilder(
+            table_a="p.d.a", table_b="p.d.b", key_columns=["id"],
+            columns=_struct_columns(),
+        )
+        assert builder._source_projection_sql() == "id, name, info, value"
+
+    def test_pipeline_source_projects_top_level_struct(self):
+        builder = QueryBuilder(
+            table_a="p.d.a", table_b="p.d.b", key_columns=["id"],
+            columns=_struct_columns(), partition_filter_b="id > 0",
+        )
+        source = builder._table_source("p.d.b", "b", "id > 0")
+        assert source.startswith("(SELECT id, name, info, value FROM")
+        assert "info.score" not in source
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"partition_filter_b": "id > 0"},
+            {"snapshot_time_b": "2026-01-01T00:00:00Z"},
+        ],
+    )
+    def test_diff_query_source_projects_top_level_struct(self, kwargs):
+        builder = QueryBuilder(
+            table_a="p.d.a", table_b="p.d.b", key_columns=["id"],
+            columns=_struct_columns(), **kwargs,
+        )
+        sql = str(builder.build_diff_query())
+        assert "SELECT id, name, info, value FROM `p.d.b`" in sql
+        assert "AS `info_score`" not in sql
+
+    def test_filtered_struct_pipeline_runs(self, bq_client, table_factory):
+        """End-to-end: struct sub-field diff detected through a filtered side."""
+        rows_a = [
+            {"id": 1, "name": "alice", "info": {"score": 9.5, "label": "A"}, "value": 100},
+        ]
+        rows_b = [
+            {"id": 1, "name": "alice", "info": {"score": 8.0, "label": "A"}, "value": 100},
+        ]
+        table_a = table_factory(MIXED_SCHEMA, rows_a)
+        table_b = table_factory(MIXED_SCHEMA, rows_b)
+
+        columns = get_table_schema(bq_client, table_a)
+        builder = QueryBuilder(
+            table_a=table_a, table_b=table_b, key_columns=["id"],
+            columns=columns, partition_filter_b="id > 0",
+        )
+        result = run_pipeline(bq_client, builder, PipelineConfig(max_diff_pct=1.0))
+
+        assert result.rows_in_both_with_differences == 1
+        assert result.column_diff_counts["info.score"] == 1
