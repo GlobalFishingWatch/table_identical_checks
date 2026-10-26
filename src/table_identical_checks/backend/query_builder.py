@@ -84,6 +84,17 @@ class QueryBuilder:
         """Get all columns with supported types (excludes UNSUPPORTED)."""
         return [c for c in self.columns if c.column_type != ColumnType.UNSUPPORTED]
 
+    def _source_projection_sql(self) -> str:
+        """Projection list for a wrapped (filtered/snapshot) source subquery.
+
+        Flattened STRUCT fields (``regions.eez``) must be projected via their
+        top-level column (``regions``): selecting the path itself names the
+        output column after its last segment (``eez``), so the outer query's
+        ``b.regions.eez`` would no longer resolve.
+        """
+        top_level = (c.name.split(".", 1)[0] for c in self._supported_columns())
+        return ", ".join(dict.fromkeys(top_level))
+
     def _create_table_objects(self) -> tuple[Selectable, Selectable]:
         """
         Create SQLAlchemy table objects for both tables.
@@ -94,7 +105,7 @@ class QueryBuilder:
         """
         supported = self._supported_columns()
         col_list = [column(col.name) for col in supported]
-        cols_sql = ", ".join(c.name for c in supported)
+        cols_sql = self._source_projection_sql()
 
         def build_side(
             table_ref: str,
@@ -102,14 +113,17 @@ class QueryBuilder:
             partition_filter: str | None,
             snapshot_time: str | None,
         ) -> Selectable:
-            # Snapshot path: SQLAlchemy can't express FOR SYSTEM_TIME directly,
-            # so wrap the FROM in a raw text() subquery and decorate it with
-            # the supported column metadata so downstream `.c.<name>` access
-            # keeps working.
-            if snapshot_time:
+            # Filtered/snapshot path: SQLAlchemy can't express FOR SYSTEM_TIME
+            # directly, and its select() would project STRUCT paths as aliased
+            # leaves, so wrap the FROM in a raw text() subquery and decorate it
+            # with the supported column metadata so downstream `.c.<name>`
+            # access keeps working.
+            if snapshot_time or partition_filter:
                 bt = self._backtick(table_ref)
                 snapshot_clause = (
                     f" FOR SYSTEM_TIME AS OF TIMESTAMP('{snapshot_time}')"
+                    if snapshot_time
+                    else ""
                 )
                 where_clause = f" WHERE {partition_filter}" if partition_filter else ""
                 raw = (
@@ -117,12 +131,7 @@ class QueryBuilder:
                 )
                 return text(raw).columns(*col_list).subquery(alias)
 
-            base = table(table_ref, *[column(c.name) for c in supported])
-            if partition_filter:
-                # Use text() not literal_column(): a WHERE predicate is a SQL
-                # fragment, not a column expression.
-                return select(base).where(text(partition_filter)).subquery(alias)
-            return base.alias(alias)
+            return table(table_ref, *[column(c.name) for c in supported]).alias(alias)
 
         table_a_obj = build_side(
             self.table_a, self.alias_a, self.partition_filter_a, self.snapshot_time_a
@@ -818,7 +827,7 @@ class QueryBuilder:
             else ""
         )
         if partition_filter or snapshot_clause:
-            cols = ", ".join(c.name for c in self._supported_columns())
+            cols = self._source_projection_sql()
             where_clause = f" WHERE {partition_filter}" if partition_filter else ""
             return f"(SELECT {cols} FROM {bt}{snapshot_clause}{where_clause}) AS {alias}"
         return f"{bt} AS {alias}"
