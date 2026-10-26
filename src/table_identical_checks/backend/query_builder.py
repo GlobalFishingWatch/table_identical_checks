@@ -2,12 +2,15 @@
 
 from dataclasses import dataclass, field
 
-from sqlalchemy import and_, column, func, literal_column, or_, select, table, text
+from sqlalchemy import and_, column, func, literal_column, or_, select, text
 from sqlalchemy.sql import Selectable
 from sqlalchemy_bigquery import BigQueryDialect
 
 from .schema import ColumnInfo, ColumnType
 from .tolerance import ToleranceConfig
+
+# Column each side's source carries with its NULL-safe join key (see _key_sql).
+KEY_COL = "__key"
 
 
 @dataclass
@@ -21,7 +24,7 @@ class QueryBuilder:
     - For geography columns: ST_DISTANCE (meters), ST_EQUALS
     - For all columns: values from both tables
 
-    NULL values are treated as equal.
+    NULL values are treated as equal, in key columns too (see _key_sql).
     Unsupported column types (ARRAY, JSON, etc.) are automatically excluded.
     Non-repeated STRUCT fields are flattened to dot-notation sub-fields at schema level.
 
@@ -84,8 +87,15 @@ class QueryBuilder:
         """Get all columns with supported types (excludes UNSUPPORTED)."""
         return [c for c in self.columns if c.column_type != ColumnType.UNSUPPORTED]
 
+    @staticmethod
+    def _quote_path(path: str) -> str:
+        """Backtick each segment of a column path (``outer.tag`` ->
+        ```outer`.`tag```), so reserved words such as OUTER or HASH work as
+        column names where they are not preceded by a table alias."""
+        return ".".join(f"`{part}`" for part in path.split("."))
+
     def _source_projection_sql(self) -> str:
-        """Projection list for a wrapped (filtered/snapshot) source subquery.
+        """Projection list for a wrapped (keyed/filtered/snapshot) source subquery.
 
         Flattened STRUCT fields (``regions.eez``) must be projected via their
         top-level column (``regions``): selecting the path itself names the
@@ -93,19 +103,38 @@ class QueryBuilder:
         ``b.regions.eez`` would no longer resolve.
         """
         top_level = (c.name.split(".", 1)[0] for c in self._supported_columns())
-        return ", ".join(dict.fromkeys(top_level))
+        return ", ".join(map(self._quote_path, dict.fromkeys(top_level)))
+
+    def _key_sql(self, qualifier: str | None = None) -> str:
+        """NULL-safe join key: all key columns serialised as one JSON string.
+
+        ``a.k = b.k`` never matches when a key column is NULL, so rows with a
+        NULL in any key column would never pair up, and BigQuery rejects
+        ``IS NOT DISTINCT FROM`` as a FULL OUTER JOIN condition. The JSON
+        string is equal exactly when every key column is equal or both NULL,
+        and it is never NULL for an existing row, so ``__key IS NOT NULL``
+        also tells whether a side is present in a joined row. Fields are
+        named by position so struct-path keys sharing a last segment
+        (``x.code``, ``y.code``) stay distinct.
+        """
+        prefix = f"{qualifier}." if qualifier else ""
+        fields = ", ".join(
+            f"{prefix}{self._quote_path(k)} AS k{i}" for i, k in enumerate(self.key_columns)
+        )
+        return f"TO_JSON_STRING(STRUCT({fields}))"
 
     def _create_table_objects(self) -> tuple[Selectable, Selectable]:
         """
         Create SQLAlchemy table objects for both tables.
 
-        Returns base selectable objects (either tables or filtered subqueries).
-        Only includes columns with supported types. Honours
+        Returns one subquery per side that projects the supported columns plus
+        the NULL-safe join key (``__key``, see :meth:`_key_sql`). Honours
         ``partition_filter_*`` and ``snapshot_time_*`` on each side.
         """
         supported = self._supported_columns()
         col_list = [column(col.name) for col in supported]
         cols_sql = self._source_projection_sql()
+        key_sql = self._key_sql()
 
         def build_side(
             table_ref: str,
@@ -113,25 +142,22 @@ class QueryBuilder:
             partition_filter: str | None,
             snapshot_time: str | None,
         ) -> Selectable:
-            # Filtered/snapshot path: SQLAlchemy can't express FOR SYSTEM_TIME
-            # directly, and its select() would project STRUCT paths as aliased
-            # leaves, so wrap the FROM in a raw text() subquery and decorate it
-            # with the supported column metadata so downstream `.c.<name>`
-            # access keeps working.
-            if snapshot_time or partition_filter:
-                bt = self._backtick(table_ref)
-                snapshot_clause = (
-                    f" FOR SYSTEM_TIME AS OF TIMESTAMP('{snapshot_time}')"
-                    if snapshot_time
-                    else ""
-                )
-                where_clause = f" WHERE {partition_filter}" if partition_filter else ""
-                raw = (
-                    f"SELECT {cols_sql} FROM {bt}{snapshot_clause}{where_clause}"
-                )
-                return text(raw).columns(*col_list).subquery(alias)
-
-            return table(table_ref, *[column(c.name) for c in supported]).alias(alias)
+            # SQLAlchemy can't express FOR SYSTEM_TIME directly, and its
+            # select() would project STRUCT paths as aliased leaves, so wrap
+            # the FROM in a raw text() subquery and decorate it with the
+            # column metadata so downstream `.c.<name>` access keeps working.
+            bt = self._backtick(table_ref)
+            snapshot_clause = (
+                f" FOR SYSTEM_TIME AS OF TIMESTAMP('{snapshot_time}')"
+                if snapshot_time
+                else ""
+            )
+            where_clause = f" WHERE {partition_filter}" if partition_filter else ""
+            raw = (
+                f"SELECT {cols_sql}, {key_sql} AS {KEY_COL} "
+                f"FROM {bt}{snapshot_clause}{where_clause}"
+            )
+            return text(raw).columns(*col_list, column(KEY_COL)).subquery(alias)
 
         table_a_obj = build_side(
             self.table_a, self.alias_a, self.partition_filter_a, self.snapshot_time_a
@@ -185,11 +211,10 @@ class QueryBuilder:
             select_cols.append(func.coalesce(table_a_obj.c[key], table_b_obj.c[key]).label(key))
 
         # Existence flags
-        first_key = self.key_columns[0]
         select_cols.extend(
             [
-                table_a_obj.c[first_key].isnot(None).label("in_a"),
-                table_b_obj.c[first_key].isnot(None).label("in_b"),
+                table_a_obj.c[KEY_COL].isnot(None).label("in_a"),
+                table_b_obj.c[KEY_COL].isnot(None).label("in_b"),
             ]
         )
 
@@ -506,9 +531,8 @@ class QueryBuilder:
                 conditions.append(self._null_safe_not_equal(col_a, col_b))
 
         # Include rows that exist in only one table
-        first_key = self.key_columns[0]
-        conditions.append(table_a_obj.c[first_key].is_(None))
-        conditions.append(table_b_obj.c[first_key].is_(None))
+        conditions.append(table_a_obj.c[KEY_COL].is_(None))
+        conditions.append(table_b_obj.c[KEY_COL].is_(None))
 
         base_condition = or_(*conditions)
 
@@ -516,10 +540,9 @@ class QueryBuilder:
         if self.tolerance_config:
             tolerance_exclusion = self._build_tolerance_exclusion(table_a_obj, table_b_obj)
             if tolerance_exclusion is not None:
-                first_key = self.key_columns[0]
                 in_both = and_(
-                    table_a_obj.c[first_key].isnot(None),
-                    table_b_obj.c[first_key].isnot(None),
+                    table_a_obj.c[KEY_COL].isnot(None),
+                    table_b_obj.c[KEY_COL].isnot(None),
                 )
                 return and_(base_condition, ~and_(in_both, tolerance_exclusion))
 
@@ -649,9 +672,8 @@ class QueryBuilder:
         """
         table_a_obj, table_b_obj = self._create_table_objects()
 
-        # Build join condition
-        join_conditions = [table_a_obj.c[key] == table_b_obj.c[key] for key in self.key_columns]
-        join_condition = and_(*join_conditions) if len(join_conditions) > 1 else join_conditions[0]
+        # NULL-safe join on the serialised key (see _key_sql)
+        join_condition = table_a_obj.c[KEY_COL] == table_b_obj.c[KEY_COL]
 
         # Build FULL OUTER JOIN
         full_join = table_a_obj.outerjoin(table_b_obj, onclause=join_condition, full=True)
@@ -743,9 +765,8 @@ class QueryBuilder:
                 conditions.append(self._null_safe_not_equal(col_a, col_b))
 
         # Include rows that exist in only one table
-        first_key = self.key_columns[0]
-        conditions.append(table_a_obj.c[first_key].is_(None))
-        conditions.append(table_b_obj.c[first_key].is_(None))
+        conditions.append(table_a_obj.c[KEY_COL].is_(None))
+        conditions.append(table_b_obj.c[KEY_COL].is_(None))
 
         return or_(*conditions)
 
@@ -810,7 +831,13 @@ class QueryBuilder:
             return self.snapshot_time_b
         return None
 
-    def _table_source(self, table_ref: str, alias: str, partition_filter: str | None) -> str:
+    def _table_source(
+        self,
+        table_ref: str,
+        alias: str,
+        partition_filter: str | None,
+        with_key: bool = False,
+    ) -> str:
         """Return a FROM-clause fragment: backticked table or filtered subquery.
 
         Honours per-side ``snapshot_time_*`` by injecting
@@ -818,6 +845,9 @@ class QueryBuilder:
         and the WHERE clause. The snapshot is picked from the QueryBuilder's
         ``snapshot_time_a`` / ``snapshot_time_b`` based on the ``table_ref``
         the caller passes (not the alias, which varies by call site).
+
+        ``with_key`` always wraps the table and adds the NULL-safe join key
+        column (``__key``, see :meth:`_key_sql`) for sources that get joined.
         """
         snapshot_time = self._snapshot_for(table_ref)
         bt = self._backtick(table_ref)
@@ -826,8 +856,10 @@ class QueryBuilder:
             if snapshot_time
             else ""
         )
-        if partition_filter or snapshot_clause:
+        if partition_filter or snapshot_clause or with_key:
             cols = self._source_projection_sql()
+            if with_key:
+                cols = f"{cols}, {self._key_sql()} AS {KEY_COL}"
             where_clause = f" WHERE {partition_filter}" if partition_filter else ""
             return f"(SELECT {cols} FROM {bt}{snapshot_clause}{where_clause}) AS {alias}"
         return f"{bt} AS {alias}"
@@ -1068,7 +1100,9 @@ class QueryBuilder:
         Uses an EXISTS subquery against ``_l1`` rather than a JOIN so that
         duplicate keys in the source table do not fan out the output. The
         semantics are: keep every row from the source whose key participates
-        in at least one L1 row matching the diff filter.
+        in at least one L1 row matching the diff filter. Keys are matched on
+        the NULL-safe ``__key`` (see :meth:`_key_sql`), computed here from the
+        source row so the written table keeps the source's own columns.
         """
         create_kw = "CREATE OR REPLACE TABLE" if write_mode == "replace" else "CREATE TABLE"
         if expiration_hours > 0:
@@ -1080,9 +1114,7 @@ class QueryBuilder:
             )
         else:
             options = ""
-        key_match = " AND ".join(
-            f"_l1.{k} = {source_alias}.{k}" for k in self.key_columns
-        )
+        key_match = f"_l1.{KEY_COL} = {self._key_sql(source_alias)}"
         return (
             f"{create_kw} `{output_table}`{options}\n"
             f"AS\n"
@@ -1132,8 +1164,8 @@ class QueryBuilder:
         return name.replace(".", "__")
 
     def _join_keys(self) -> str:
-        """Build the ON clause for FULL OUTER JOIN on key columns."""
-        return " AND ".join(f"a.{k} = b.{k}" for k in self.key_columns)
+        """Build the ON clause for the FULL OUTER JOIN (NULL-safe, see _key_sql)."""
+        return f"a.{KEY_COL} = b.{KEY_COL}"
 
     def _coalesced_keys(self) -> str:
         """Build COALESCE(a.key, b.key) AS key for each key column."""
@@ -1171,7 +1203,9 @@ class QueryBuilder:
             A multi-statement SQL script string to execute as a single BQ job.
         """
         value_cols = self._value_columns()
-        first_key = self.key_columns[0]
+        # Presence of each side in a joined row, from the NULL-safe key column
+        # (never NULL for an existing row, unlike a key column itself).
+        in_a, in_b = f"a.{KEY_COL} IS NOT NULL", f"b.{KEY_COL} IS NOT NULL"
 
         # Build set of columns that have any tolerance configured (abs or rel)
         # Build set of columns that have any tolerance configured.
@@ -1202,8 +1236,8 @@ class QueryBuilder:
         l1_select_parts = [self._coalesced_keys()]
 
         # Existence flags
-        l1_select_parts.append(f"  a.{first_key} IS NOT NULL AS in_a")
-        l1_select_parts.append(f"  b.{first_key} IS NOT NULL AS in_b")
+        l1_select_parts.append(f"  {in_a} AS in_a")
+        l1_select_parts.append(f"  {in_b} AS in_b")
 
         # Per-column equality flags
         for col in value_cols:
@@ -1225,7 +1259,7 @@ class QueryBuilder:
         # are carried via their top-level column so ``a.info.score`` resolves.
         row_fields = list(dict.fromkeys(c.name.split(".", 1)[0] for c in value_cols))
         if row_fields:
-            matched = f"a.{first_key} IS NOT NULL AND b.{first_key} IS NOT NULL"
+            matched = f"{in_a} AND {in_b}"
             for side in ("a", "b"):
                 fields = ", ".join(f"{side}.{f} AS `{f}`" for f in row_fields)
                 l1_select_parts.append(
@@ -1236,6 +1270,8 @@ class QueryBuilder:
         # decide which matched rows belong in the per-side diff outputs.
         row_wt_expr = None
         if output_diff is not None:
+            # The diff-split statements match source rows to _l1 on this key.
+            l1_select_parts.append(f"  COALESCE(a.{KEY_COL}, b.{KEY_COL}) AS {KEY_COL}")
             row_wt_expr = self._l1_row_within_tolerance_sql(value_cols, tol_cols)
             if row_wt_expr is not None:
                 l1_select_parts.append(
@@ -1258,13 +1294,17 @@ class QueryBuilder:
             else:
                 l1_where_parts.append(f"NOT {self._l1_null_safe_eq(col.name)}")
 
-        l1_where_parts.append(f"a.{first_key} IS NULL")
-        l1_where_parts.append(f"b.{first_key} IS NULL")
+        l1_where_parts.append(f"NOT {in_a}")
+        l1_where_parts.append(f"NOT {in_b}")
 
         l1_where = "\n  OR ".join(l1_where_parts)
 
-        source_a_join = self._table_source(self.table_a, "a", self.partition_filter_a)
-        source_b_join = self._table_source(self.table_b, "b", self.partition_filter_b)
+        source_a_join = self._table_source(
+            self.table_a, "a", self.partition_filter_a, with_key=True
+        )
+        source_b_join = self._table_source(
+            self.table_b, "b", self.partition_filter_b, with_key=True
+        )
 
         l1_stmt = (
             "CREATE TEMP TABLE _l1 AS\n"
@@ -1602,10 +1642,12 @@ class QueryBuilder:
                 filter_a = "_l1.in_a"
                 filter_b = "_l1.in_b"
 
+            # Plain sources (no __key column), so `SELECT a.*` writes the
+            # source's own columns only.
             stmt_a = self._build_diff_split_statement(
                 output_table=output_diff.output_a,
                 source_alias="a",
-                source_sql=source_a_join,
+                source_sql=self._table_source(self.table_a, "a", self.partition_filter_a),
                 diff_filter=filter_a,
                 write_mode=output_diff.write_mode,
                 expiration_hours=output_diff.expiration_hours,
@@ -1613,7 +1655,7 @@ class QueryBuilder:
             stmt_b = self._build_diff_split_statement(
                 output_table=output_diff.output_b,
                 source_alias="b",
-                source_sql=source_b_join,
+                source_sql=self._table_source(self.table_b, "b", self.partition_filter_b),
                 diff_filter=filter_b,
                 write_mode=output_diff.write_mode,
                 expiration_hours=output_diff.expiration_hours,

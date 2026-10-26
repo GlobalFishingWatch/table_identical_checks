@@ -187,12 +187,12 @@ def test_pipeline_script_injects_per_side_snapshots():
     assert "FOR SYSTEM_TIME AS OF TIMESTAMP('2026-05-01 00:00:00 UTC')" in script
     # Crucially: A's row-count subquery uses A's snapshot and B's uses B's
     assert (
-        "SET total_rows_a = (SELECT COUNT(*) FROM (SELECT id, val "
+        "SET total_rows_a = (SELECT COUNT(*) FROM (SELECT `id`, `val` "
         "FROM `proj.ds.tab_a` FOR SYSTEM_TIME AS OF TIMESTAMP("
         "'2026-05-08 12:00:00 UTC')) AS t)"
     ) in script
     assert (
-        "SET total_rows_b = (SELECT COUNT(*) FROM (SELECT id, val "
+        "SET total_rows_b = (SELECT COUNT(*) FROM (SELECT `id`, `val` "
         "FROM `proj.ds.tab_b` FOR SYSTEM_TIME AS OF TIMESTAMP("
         "'2026-05-01 00:00:00 UTC')) AS t)"
     ) in script
@@ -202,9 +202,9 @@ def test_pipeline_script_supports_snapshot_on_only_one_side():
     b = _builder(snapshot_a="2026-05-08 12:00:00 UTC")
     script = b.build_pipeline_script()
     assert "FOR SYSTEM_TIME AS OF TIMESTAMP('2026-05-08 12:00:00 UTC')" in script
-    # B should still appear (FROM ... AS b, the join alias) without FOR SYSTEM_TIME
-    # attached. The only FOR SYSTEM_TIME usage should reference tab_a.
-    assert "`proj.ds.tab_b` AS b" in script
+    # B should still appear (its keyed join subquery, alias b) without FOR
+    # SYSTEM_TIME attached. The only FOR SYSTEM_TIME usage should reference tab_a.
+    assert "FROM `proj.ds.tab_b`) AS b" in script
     for_system_time_lines = [ln for ln in script.split("\n") if "FOR SYSTEM_TIME" in ln]
     assert all("tab_a" in ln for ln in for_system_time_lines)
     assert not any("tab_b" in ln for ln in for_system_time_lines)

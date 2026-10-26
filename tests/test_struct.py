@@ -633,7 +633,7 @@ class TestStructInWrappedSource:
             table_a="p.d.a", table_b="p.d.b", key_columns=["id"],
             columns=_struct_columns(),
         )
-        assert builder._source_projection_sql() == "id, name, info, value"
+        assert builder._source_projection_sql() == "`id`, `name`, `info`, `value`"
 
     def test_pipeline_source_projects_top_level_struct(self):
         builder = QueryBuilder(
@@ -641,7 +641,7 @@ class TestStructInWrappedSource:
             columns=_struct_columns(), partition_filter_b="id > 0",
         )
         source = builder._table_source("p.d.b", "b", "id > 0")
-        assert source.startswith("(SELECT id, name, info, value FROM")
+        assert source.startswith("(SELECT `id`, `name`, `info`, `value` FROM")
         assert "info.score" not in source
 
     @pytest.mark.parametrize(
@@ -657,7 +657,10 @@ class TestStructInWrappedSource:
             columns=_struct_columns(), **kwargs,
         )
         sql = str(builder.build_diff_query())
-        assert "SELECT id, name, info, value FROM `p.d.b`" in sql
+        assert (
+            "SELECT `id`, `name`, `info`, `value`, TO_JSON_STRING(STRUCT(`id` AS k0)) "
+            "AS __key FROM `p.d.b`"
+        ) in sql
         assert "AS `info_score`" not in sql
 
     def test_filtered_struct_pipeline_runs(self, bq_client, table_factory):
