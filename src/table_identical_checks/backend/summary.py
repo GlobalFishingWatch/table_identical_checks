@@ -1705,14 +1705,17 @@ def build_verify_query(summary: ComparisonSummary) -> str:
     not_comparable = {c for c, t in types.items() if t in _NOT_SET_COMPARABLE} - differing
     compared = [c for c in types if c not in differing | not_comparable]
 
+    # Backticks throughout: these columns are not preceded by a table alias,
+    # so a reserved word such as OUTER or END would otherwise be a syntax error.
     def _alias(col: str) -> str:
-        return col.replace(".", "__")
+        return f"`{col.replace('.', '__')}`"
 
     def _projection(col: str) -> str:
+        path = ".".join(f"`{part}`" for part in col.split("."))
         expr = (
-            QueryBuilder._array_canonical_sql(col)
+            QueryBuilder._array_canonical_sql(path)
             if types.get(col) == ColumnType.ARRAY
-            else col
+            else path
         )
         return expr if expr == _alias(col) else f"{expr} AS {_alias(col)}"
 

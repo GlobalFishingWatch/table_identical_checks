@@ -42,8 +42,8 @@ class TestVerifyQuerySql:
     def test_array_uses_pipeline_canonical_form(self):
         sql = build_verify_query(_summary({"tags": ColumnType.ARRAY}))
 
-        canonical = QueryBuilder._array_canonical_sql("tags")
-        assert f"{canonical} AS tags" in sql
+        canonical = QueryBuilder._array_canonical_sql("`tags`")
+        assert f"{canonical} AS `tags`" in sql
         assert "SELECT *\n" not in sql.split("missing_in_a")[0]
 
     def test_struct_selected_by_leaf_path(self):
@@ -51,9 +51,9 @@ class TestVerifyQuerySql:
             _summary({"info.score": ColumnType.FLOAT, "info.label": ColumnType.STRING})
         )
 
-        assert "info.score AS info__score" in sql
-        assert "info.label AS info__label" in sql
-        assert "    info,\n" not in sql
+        assert "`info`.`score` AS `info__score`" in sql
+        assert "`info`.`label` AS `info__label`" in sql
+        assert "    `info`,\n" not in sql
 
     def test_skipped_columns_listed_in_header(self):
         sql = build_verify_query(
@@ -74,9 +74,9 @@ class TestVerifyQuerySql:
         assert "--   name (has differences)" in header
         assert "--   geom (geography: no set-comparable form)" in header
         assert "--   sketch (kll_float64: no set-comparable form)" in header
-        assert "    id,\n    value\n" in body
+        assert "    `id`,\n    `value`\n" in body
         for col in ("geom", "sketch", "name", "payload"):
-            assert f"    {col}" not in body
+            assert f"`{col}`" not in body
 
     def test_no_header_when_everything_compared(self):
         sql = build_verify_query(_summary({"value": ColumnType.INTEGER}))
@@ -87,15 +87,16 @@ class TestVerifyQuerySql:
         summary.key_columns = ["id", "ref.code"]
         sql = build_verify_query(summary)
 
-        assert "ref.code AS ref__code" in sql
-        assert sql.endswith("ORDER BY id, ref__code, which")
+        assert "`ref`.`code` AS `ref__code`" in sql
+        assert sql.endswith("ORDER BY `id`, `ref__code`, which")
 
 
+# `outer` is a reserved word: the emitted query must backtick column paths.
 VERIFY_SCHEMA = [
     bigquery.SchemaField("id", "INT64"),
     bigquery.SchemaField("tags", "STRING", mode="REPEATED"),
     bigquery.SchemaField(
-        "info",
+        "outer",
         "STRUCT",
         fields=[
             bigquery.SchemaField("score", "FLOAT64"),
@@ -109,7 +110,7 @@ VERIFY_SCHEMA = [
 class TestVerifyQueryRuns:
     def test_verify_query_runs_on_array_struct_geography(self, bq_client, table_factory):
         """Same rows (arrays in a different order) plus one row only in A."""
-        shared = {"info": {"score": 1.5, "label": "x"}, "location": "POINT(1 2)"}
+        shared = {"outer": {"score": 1.5, "label": "x"}, "location": "POINT(1 2)"}
         rows_a = [
             {"id": 1, "tags": ["a", "b"], **shared},
             {"id": 2, "tags": ["c"], **shared},
