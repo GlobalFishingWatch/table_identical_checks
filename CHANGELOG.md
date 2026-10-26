@@ -5,6 +5,20 @@ All notable changes to `table-identical-checks` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0](https://github.com/GlobalFishingWatch/table_identical_checks/compare/v0.2.1...v0.3.0) (2026-10-26)
+
+
+### Added
+
+* interactive prompts for summary's common parameters ([559dbae](https://github.com/GlobalFishingWatch/table_identical_checks/commit/559dbaecadee3c92662251bcbd311d6d09e94b54))
+
+
+### Fixed
+
+* compute Layer 2 deltas from the pairs Layer 1 compared ([#11](https://github.com/GlobalFishingWatch/table_identical_checks/issues/11)) ([f65cc65](https://github.com/GlobalFishingWatch/table_identical_checks/commit/f65cc659e46ec6207ad0409677c6f37827808c85))
+* make verify-query run on ARRAY and STRUCT columns ([#13](https://github.com/GlobalFishingWatch/table_identical_checks/issues/13)) ([287fa1f](https://github.com/GlobalFishingWatch/table_identical_checks/commit/287fa1ff4a12bbf24be7f4be86019ab3865dee55))
+* project STRUCT columns by top-level name in wrapped sources ([#12](https://github.com/GlobalFishingWatch/table_identical_checks/issues/12)) ([1fd64de](https://github.com/GlobalFishingWatch/table_identical_checks/commit/1fd64deb04b9089fc1684aa318a485852776c2f3))
+
 ## [0.2.1](https://github.com/GlobalFishingWatch/table_identical_checks/compare/v0.2.0...v0.2.1) (2026-06-12)
 
 
