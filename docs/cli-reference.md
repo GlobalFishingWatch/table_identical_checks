@@ -115,8 +115,16 @@ Useful as an independent sanity check: paste the emitted query into BigQuery,
 and a zero-row result confirms the summary's equality verdict on those
 columns.
 
-Columns with differences, unsupported-type columns, and `GEOGRAPHY` columns
-(not groupable in BQ) are excluded from the probe.
+Both sides select the same explicit column list (keys first), so columns line
+up by name rather than by position. `EXCEPT DISTINCT` rejects `ARRAY`,
+`STRUCT`, `GEOGRAPHY` and `JSON`, so:
+
+- STRUCT fields are selected by leaf path (`info.score AS info__score`).
+- ARRAY columns are compared in the same canonical form the comparison uses
+  (elements sorted by their JSON), so element order is ignored.
+- Columns with differences, unsupported-type columns, and `GEOGRAPHY` and KLL
+  sketch columns (whose equality checks have no set-comparable form) are left
+  out and listed in a comment at the top of the emitted query.
 
 | Option | Type | Default | Description |
 |---|---|---|---|

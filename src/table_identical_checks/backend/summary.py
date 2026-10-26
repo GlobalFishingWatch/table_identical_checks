@@ -1679,27 +1679,55 @@ def from_json_dict(data: dict) -> ComparisonSummary:
 # ---------------------------------------------------------------------------
 
 
-def build_verify_query(summary: ComparisonSummary) -> str:
-    """Build a SELECT * EXCEPT(...) + EXCEPT DISTINCT / UNION ALL verification SQL.
+# Types whose pipeline equality has no EXCEPT DISTINCT equivalent: GEOGRAPHY
+# is compared with ST_EQUALS (topological), KLL sketches via quantile probes.
+_NOT_SET_COMPARABLE = (ColumnType.GEOGRAPHY, ColumnType.KLL_FLOAT64, ColumnType.KLL_INT64)
 
-    Confirms the two tables are identical after excluding:
+
+def build_verify_query(summary: ComparisonSummary) -> str:
+    """Build an EXCEPT DISTINCT / UNION ALL verification SQL from a summary.
+
+    Both sides project the same explicit column list (keys, then value
+    columns), so they line up by name rather than by position, and every
+    projected expression is one EXCEPT DISTINCT accepts (it rejects ARRAY,
+    STRUCT, GEOGRAPHY and JSON):
+      * STRUCT fields are selected by leaf path (``info.score AS info__score``)
+      * ARRAY columns use the pipeline's canonical form (elements sorted by
+        their JSON), i.e. the same multiset equality the pipeline applies
+
+    Not compared, and listed in a comment at the top of the query:
       * columns the pipeline skipped (unsupported types)
       * columns with pre-tolerance differences
-      * GEOGRAPHY columns (not groupable, unusable with EXCEPT DISTINCT)
-
-    For STRUCT-flattened columns (dot-notation), excludes the top-level parent.
+      * GEOGRAPHY and KLL sketch columns (see _NOT_SET_COMPARABLE)
     """
-    exclude: set[str] = set()
-    for col_name, _ in summary.excluded_columns:
-        exclude.add(col_name.split(".")[0])
-    for col_name, count in summary.column_diff_counts.items():
-        if count > 0:
-            exclude.add(col_name.split(".")[0])
-    for col_name, col_type in summary.column_types.items():
-        if col_type == ColumnType.GEOGRAPHY:
-            exclude.add(col_name.split(".")[0])
+    types = summary.column_types
+    differing = {c for c, n in summary.column_diff_counts.items() if n > 0}
+    not_comparable = {c for c, t in types.items() if t in _NOT_SET_COMPARABLE} - differing
+    compared = [c for c in types if c not in differing | not_comparable]
 
-    except_clause = f" EXCEPT({', '.join(sorted(exclude))})" if exclude else ""
+    def _alias(col: str) -> str:
+        return col.replace(".", "__")
+
+    def _projection(col: str) -> str:
+        expr = (
+            QueryBuilder._array_canonical_sql(col)
+            if types.get(col) == ColumnType.ARRAY
+            else col
+        )
+        return expr if expr == _alias(col) else f"{expr} AS {_alias(col)}"
+
+    select_list = ",\n    ".join(map(_projection, [*summary.key_columns, *compared]))
+
+    skipped = [
+        *(f"{name} ({bq_type}: unsupported type)" for name, bq_type in summary.excluded_columns),
+        *(f"{c} (has differences)" for c in sorted(differing)),
+        *(f"{c} ({types[c].value}: no set-comparable form)" for c in sorted(not_comparable)),
+    ]
+    header = (
+        "-- Not compared:\n" + "".join(f"--   {s}\n" for s in skipped) + "\n"
+        if skipped
+        else ""
+    )
 
     def _source(table: str, partition_filter: str | None) -> str:
         bt = f"`{table}`"
@@ -1712,14 +1740,15 @@ def build_verify_query(summary: ComparisonSummary) -> str:
 
     # Order the final result by the join keys, then by `which`, so missing
     # rows for the same key on either side appear together.
-    order_cols = ", ".join([*summary.key_columns, "which"])
+    order_cols = ", ".join([*map(_alias, summary.key_columns), "which"])
 
     return (
+        f"{header}"
         f"WITH a AS (\n"
-        f"  SELECT *{except_clause} FROM {a_src}\n"
+        f"  SELECT\n    {select_list}\n  FROM {a_src}\n"
         f"),\n\n"
         f"b AS (\n"
-        f"  SELECT *{except_clause} FROM {b_src}\n"
+        f"  SELECT\n    {select_list}\n  FROM {b_src}\n"
         f"),\n\n"
         f"missing_in_a AS (\n"
         f"  SELECT * FROM b\n"
