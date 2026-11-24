@@ -79,7 +79,8 @@ def _resolve_column_patterns(
     pattern that matches nothing else is an error (likely a typo, or only
     keys).
     """
-    candidates = [c for c in column_names if c not in set(key_columns)]
+    keys = set(key_columns)
+    candidates = [c for c in column_names if c not in keys]
 
     def matches(pattern: str) -> list[str]:
         return [
@@ -1247,7 +1248,8 @@ def summary(
             "--expect-diff: unsupported-type column(s) are never compared, "
             f"use --ignore-columns instead: {', '.join(unsupported)}"
         )
-    columns = [c for c in columns if c.name not in set(ignored)]
+    ignored_set = set(ignored)
+    columns = [c for c in columns if c.name not in ignored_set]
 
     # Get partition filters
     filter_a, filter_b = get_partition_filters(
