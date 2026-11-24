@@ -112,17 +112,24 @@ def _format_duplicate_warning(summary: "ComparisonSummary") -> list[str]:
     banner = "!" * 60
     lines.append("")
     lines.append(banner)
-    lines.append("!! DUPLICATE KEYS DETECTED !!")
-    lines.append(banner)
-    lines.append("  Comparison results may be unreliable when keys are not unique.")
+    if summary.keyless:
+        lines.append("!! DUPLICATE ROWS DETECTED !!")
+        lines.append(banner)
+        lines.append("  Identical copies of a row are counted, so they can't cancel out.")
+        noun = "row"
+    else:
+        lines.append("!! DUPLICATE KEYS DETECTED !!")
+        lines.append(banner)
+        lines.append("  Comparison results may be unreliable when keys are not unique.")
+        noun = "key"
     lines.append("")
 
     for label, info in [("Table A", dup_a), ("Table B", dup_b)]:
         if info and info.has_duplicates:
             lines.append(
-                f"  {label}: {info.duplicate_key_count:,} duplicate key(s), "
+                f"  {label}: {info.duplicate_key_count:,} duplicate {noun}(s), "
                 f"{info.duplicate_row_count:,} rows affected, "
-                f"max {info.max_duplicate_count}x per key"
+                f"max {info.max_duplicate_count}x per {noun}"
             )
 
     lines.append(banner)
@@ -914,6 +921,12 @@ class ComparisonSummary:
     # or expected to differ.
     schema_drift: list[list[str]] = field(default_factory=list)
 
+    # Keyless mode (--keyless): whole rows compared as multisets, no per-column
+    # stats. sample_rows holds up to a few surplus rows per side, as dicts
+    # with side, row (JSON string), n_a and n_b.
+    keyless: bool = False
+    sample_rows: list[dict] = field(default_factory=list)
+
     @property
     def total_differences(self) -> int:
         return self.rows_only_in_a + self.rows_only_in_b + self.rows_in_both_with_differences
@@ -1039,13 +1052,98 @@ class ComparisonSummary:
         return has_abs or has_rel
 
     def __str__(self) -> str:
+        if self.keyless:
+            return _format_keyless(self)
         formatter = get_formatter(self.output_format)
         return formatter.format(self)
+
+
+def _format_keyless(summary: ComparisonSummary) -> str:
+    """Render a keyless summary: row counts, duplicates and sample rows only."""
+    w = TableFormatter.WIDTH
+    lines = [
+        "=" * w,
+        f"{' table comparison (keyless) ':=^{w}}",
+        f"{summary.table_a} vs {summary.table_b}",
+        "keys: none (keyless: whole rows compared, identical-only)",
+        *_format_duplicate_warning(summary),
+    ]
+    if summary.excluded_columns:
+        lines.append(
+            "!! EXCLUDED: "
+            + ", ".join(f"{n} ({t})" for n, t in sorted(summary.excluded_columns))
+        )
+    lines.extend(
+        [
+            f"rows: {summary.total_rows_a:,} vs {summary.total_rows_b:,}",
+            f"identical: {summary.rows_identical:,} | only in A: {summary.rows_only_in_a:,} "
+            f"| only in B: {summary.rows_only_in_b:,}",
+        ]
+    )
+    for side, label in (("only_in_a", "A"), ("only_in_b", "B")):
+        samples = [s for s in summary.sample_rows if s["side"] == side]
+        if samples:
+            lines.append("")
+            lines.append(f"Sample rows only in {label} (copies in A / B):")
+            lines.extend(f"  {s['n_a']} / {s['n_b']}: {s['row']}" for s in samples)
+    lines.append("=" * w)
+    lines.append(
+        f"{'IDENTICAL':=^{w}}" if summary.tables_identical else f"{' DIFFERENCES FOUND ':=^{w}}"
+    )
+    lines.extend(_format_verdict(summary))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Summary generation
 # ---------------------------------------------------------------------------
+
+
+def generate_keyless_summary(
+    client: bigquery.Client,
+    builder: QueryBuilder,
+    output_format: str = "verbose",
+) -> ComparisonSummary:
+    """Compare two tables without keys: identical rows only, duplicate-aware.
+
+    One multi-statement job (see QueryBuilder.build_keyless_script). Value
+    deltas need keys to pair rows, so no per-column stats are produced.
+    """
+    row = dict(next(iter(client.query(builder.build_keyless_script()).result())))
+
+    def dup_info(side: str) -> DuplicateInfo:
+        return DuplicateInfo(
+            duplicate_key_count=row[f"dupes_{side}"],
+            duplicate_row_count=row[f"dupe_rows_{side}"],
+            max_duplicate_count=row[f"max_dupe_count_{side}"],
+        )
+
+    return ComparisonSummary(
+        table_a=builder.table_a,
+        table_b=builder.table_b,
+        key_columns=[],
+        rows_only_in_a=row["rows_only_in_a"],
+        rows_only_in_b=row["rows_only_in_b"],
+        rows_in_both_with_differences=0,
+        rows_identical=row["rows_identical"],
+        total_rows_a=row["total_rows_a"],
+        total_rows_b=row["total_rows_b"],
+        numeric_column_stats={},
+        string_column_mismatches={},
+        excluded_columns=[(c.name, c.bq_type) for c in builder.excluded_columns],
+        column_types={
+            c.name: c.column_type
+            for c in builder.columns
+            if c.column_type != ColumnType.UNSUPPORTED
+        },
+        duplicate_info_a=dup_info("a"),
+        duplicate_info_b=dup_info("b"),
+        partition_filter_a=builder.partition_filter_a,
+        partition_filter_b=builder.partition_filter_b,
+        output_format=output_format,
+        keyless=True,
+        sample_rows=[dict(s) for s in row["samples"]],
+    )
 
 
 def _reject_array_tolerance(builder: QueryBuilder) -> None:

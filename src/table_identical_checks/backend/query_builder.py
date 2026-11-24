@@ -811,6 +811,95 @@ class QueryBuilder:
             f"  (SELECT IFNULL(MAX(n), 0) FROM dupes_b) AS max_dupe_count_b"
         )
 
+    def _keyless_row_sql(self) -> str:
+        """One row serialised as a JSON string, for keyless (identical-only) mode.
+
+        Every supported column is selected by its flattened path, qualified
+        with the source alias ``t`` (so a column named ``t`` can't resolve to
+        the whole row), and STRUCTs don't need to match field-for-field.
+        Normalisation, so keyless agrees with the keyed comparison:
+
+        - ARRAYs use the order-insensitive canonical form (NULL stays NULL);
+        - FLOATs add 0.0, which turns -0.0 into 0.0 (they're equal in SQL);
+        - each STRUCT gets an ``IS NULL`` flag, so a NULL STRUCT doesn't
+          serialise like a STRUCT whose fields are all NULL.
+
+        GEOGRAPHY compares by its text form, which is stricter than ST_EQUALS.
+        """
+        def field(col: ColumnInfo) -> str:
+            path = f"t.{self._quote_path(col.name)}"
+            if col.column_type == ColumnType.ARRAY:
+                expr = self._array_canonical_sql(path)
+            elif col.column_type == ColumnType.FLOAT:
+                expr = f"({path} + 0.0)"
+            else:
+                expr = path
+            return f"{expr} AS `{self._safe_alias(col.name)}`"
+
+        columns = self._supported_columns()
+        struct_paths = dict.fromkeys(
+            ".".join(parts[:depth])
+            for parts in (c.name.split(".") for c in columns)
+            for depth in range(1, len(parts))
+        )
+        null_flags = [
+            f"t.{self._quote_path(p)} IS NULL AS `{self._safe_alias(p)}__is_null`"
+            for p in struct_paths
+        ]
+        fields = ", ".join([*map(field, columns), *null_flags])
+        return f"TO_JSON_STRING(STRUCT({fields}))"
+
+    def build_keyless_script(self, sample_limit: int = 5) -> str:
+        """Build the keyless, identical-only comparison as a single query.
+
+        Rows are compared as multisets: each distinct serialised row is
+        counted per side (``n_a``, ``n_b``). Surplus copies on one side count
+        as only-in-that-side, so duplicates can't cancel out: ``{X, X, Y}``
+        against ``{X, Y, Y}`` is one row only in A and one only in B. The
+        result row also carries duplicate-row stats per side and up to
+        ``sample_limit`` surplus rows per side. The samples are aggregated
+        in the same pass (no temp table), so the serialised rows aren't read
+        and billed a second time.
+        """
+        row = self._keyless_row_sql()
+        source_a = self._table_source(self.table_a, "t", self.partition_filter_a)
+        source_b = self._table_source(self.table_b, "t", self.partition_filter_b)
+
+        def samples(side: str, condition: str) -> str:
+            return (
+                f"IFNULL(ARRAY_AGG(IF({condition}, STRUCT('{side}' AS side, row, n_a, n_b), "
+                f"NULL) IGNORE NULLS ORDER BY row LIMIT {sample_limit}), [])"
+            )
+
+        return (
+            "WITH ca AS (\n"
+            f"  SELECT {row} AS row, COUNT(*) AS n FROM {source_a} GROUP BY row\n"
+            "), cb AS (\n"
+            f"  SELECT {row} AS row, COUNT(*) AS n FROM {source_b} GROUP BY row\n"
+            "), _kl AS (\n"
+            "  SELECT COALESCE(ca.row, cb.row) AS row, IFNULL(ca.n, 0) AS n_a, "
+            "IFNULL(cb.n, 0) AS n_b\n"
+            "  FROM ca\n"
+            "  FULL OUTER JOIN cb\n"
+            "    ON ca.row = cb.row\n"
+            ")\n"
+            "SELECT\n"
+            "  IFNULL(SUM(n_a), 0) AS total_rows_a,\n"
+            "  IFNULL(SUM(n_b), 0) AS total_rows_b,\n"
+            "  IFNULL(SUM(LEAST(n_a, n_b)), 0) AS rows_identical,\n"
+            "  IFNULL(SUM(GREATEST(n_a - n_b, 0)), 0) AS rows_only_in_a,\n"
+            "  IFNULL(SUM(GREATEST(n_b - n_a, 0)), 0) AS rows_only_in_b,\n"
+            "  COUNTIF(n_a > 1) AS dupes_a,\n"
+            "  IFNULL(SUM(IF(n_a > 1, n_a, 0)), 0) AS dupe_rows_a,\n"
+            "  IFNULL(MAX(IF(n_a > 1, n_a, NULL)), 0) AS max_dupe_count_a,\n"
+            "  COUNTIF(n_b > 1) AS dupes_b,\n"
+            "  IFNULL(SUM(IF(n_b > 1, n_b, 0)), 0) AS dupe_rows_b,\n"
+            "  IFNULL(MAX(IF(n_b > 1, n_b, NULL)), 0) AS max_dupe_count_b,\n"
+            f"  ARRAY_CONCAT({samples('only_in_a', 'n_a > n_b')}, "
+            f"{samples('only_in_b', 'n_b > n_a')}) AS samples\n"
+            "FROM _kl\n"
+        )
+
     def get_table_objects(self) -> tuple[Selectable, Selectable]:
         """
         Get the SQLAlchemy table objects for use in other queries.

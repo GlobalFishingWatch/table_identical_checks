@@ -72,6 +72,29 @@ The original multi-query approach. Executes 2 + N queries where N is the number 
 | Tables identical | ~22 queries | 1 job (Layer 2 is empty) |
 | Circuit breaker triggers | N/A | 1 job (stops after Layer 1) |
 
+## Keyless Mode (`--keyless`)
+
+A single query (`QueryBuilder.build_keyless_script()`, summarised by `generate_keyless_summary()`):
+
+```
+WITH ca  AS (SELECT row_json AS row, COUNT(*) AS n FROM table_a AS t GROUP BY row),
+     cb  AS (... table_b ...),
+     _kl AS (SELECT row, n_a, n_b FROM ca FULL OUTER JOIN cb ON ca.row = cb.row)
+SELECT SUM(LEAST(n_a, n_b))          AS rows_identical,
+       SUM(GREATEST(n_a - n_b, 0))   AS rows_only_in_a,   -- and the mirror for B
+       duplicate-row stats per side,
+       ARRAY_AGG(... IGNORE NULLS ORDER BY row LIMIT 5)   -- sample surplus rows
+FROM _kl
+```
+
+- **Row form.** `row_json` is `TO_JSON_STRING(STRUCT(...))` over the flattened supported columns, each qualified with the source alias `t`. It's normalised to agree with keyed mode:
+  - ARRAY leaves use the canonical (sorted) form, and NULL stays NULL;
+  - FLOAT leaves add `0.0`, so `-0.0` matches `0.0`;
+  - every STRUCT gets an `IS NULL` flag, so a NULL STRUCT differs from a STRUCT of NULLs.
+- **Multiset counting.** Counting copies, rather than comparing distinct rows with `EXCEPT DISTINCT`, is what stops duplicates cancelling out.
+- **Cost.** It's a single query, not a script with a temp table, so the serialised rows are never re-read and billed again. The GROUP BY over JSON strings does cost more slot time than the keyed pipeline.
+- **What's not produced.** There are no keys, so there are no per-column stats or tolerance. The verdict depends on the only-in-A/B counts, duplicate rows and schema drift.
+
 ## STRUCT Handling
 
 Non-repeated STRUCT/RECORD fields are flattened at schema level by `_flatten_fields()` in `schema.py`:
