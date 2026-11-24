@@ -22,7 +22,7 @@ The `table-check` CLI has six commands. Shared conventions:
 |---|---|
 | `0` | `summary` / `format`: verdict PASS. Other commands: succeeded |
 | `1` | `summary` / `format`: verdict FAIL (see [Verdict](#verdict)) |
-| `2` | Error: bad options, a missing file, a BigQuery error, or any other crash |
+| `2` | Error: bad options, a missing file, a BigQuery error, any other crash (with a traceback on stderr), Ctrl-C, or output closed early (broken pipe) |
 
 Versions without this section exited 0 whatever the comparison found. Callers that treat any non-zero status as a crash need to accept `1` as "differences found".
 
