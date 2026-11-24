@@ -95,6 +95,9 @@ BQ_SCRATCH_DATASET=project.scratch_dataset \
 # Declare upfront what may change: expected columns are still reported but
 # don't fail the PASS/FAIL verdict; ignored columns aren't queried at all
 table-check summary ... --expect-diff='regions.*' --ignore-columns=created_at,'*_loaded_ts'
+
+# No natural key: compare whole rows (identical-only, duplicate-aware)
+table-check summary --keyless --table-a=... --table-b=...
 ```
 
 `summary` (and `format`) exit `0` on PASS, `1` on FAIL and `2` on any error, so scripts and CI can use the exit status directly; see [Exit codes](docs/cli-reference.md#exit-codes).

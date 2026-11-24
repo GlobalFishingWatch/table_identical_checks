@@ -60,6 +60,18 @@ multi-statement job.
 | `--expect-diff` | TEXT (repeatable) | None | Columns expected to differ. They are still compared and reported (status `EXPECT`), but never fail the verdict. Comma-separated glob patterns over flattened names, e.g. `regions.*`. A bare STRUCT name (`regions`) matches all its fields |
 | `--ignore-columns` | TEXT (repeatable) | None | Columns left out of the comparison entirely. Same pattern syntax. A top-level column that is ignored isn't read at all. Ignoring only some fields of a STRUCT still reads the STRUCT, because the other fields are compared. `--write-diffs` copies whole rows regardless |
 
+| `--keyless` | FLAG | False | Compare whole rows without keys (see [Keyless mode](#keyless-mode)) |
+
+### Keyless mode
+
+`--keyless` compares whole rows instead of joining on keys. Use it when a table has no natural key and you only need to know whether two tables hold the same rows.
+
+- **Identical-only.** Values must match exactly: floats have no tolerance, and GEOGRAPHY compares by its text form. Pairing rows needs keys, so there are no per-column deltas.
+- **Row form.** Each row is serialised by flattened column path, so STRUCT subfields line up by name. ARRAYs ignore element order, as in keyed mode.
+- **Duplicate-aware.** Each distinct row is counted on both sides, and surplus copies count as rows only in that side. `{X, X, Y}` against `{X, Y, Y}` is one row only in A and one only in B, not "identical". Duplicate rows are reported per side.
+- **Output.** The summary shows identical / only-in-A / only-in-B row counts and up to 5 sample rows per side with their copy counts. The verdict and exit code work as for keyed runs.
+- **Restrictions.** It can't be combined with `--keys`, `--interactive`, `--tolerance` / `--rel-tolerance`, the KLL options, `--write-diffs`, `--legacy`, `--max-diff-pct` or `--expect-diff`. `--ignore-columns`, partition filters and snapshots work.
+
 ### Verdict
 
 Every summary ends with `VERDICT: PASS` or `VERDICT: FAIL (...)`. The JSON output has a matching `verdict` field, a `failing_columns` list and a `fail_reasons` list.

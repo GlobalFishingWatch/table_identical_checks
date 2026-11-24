@@ -72,6 +72,26 @@ The original multi-query approach. Executes 2 + N queries where N is the number 
 | Tables identical | ~22 queries | 1 job (Layer 2 is empty) |
 | Circuit breaker triggers | N/A | 1 job (stops after Layer 1) |
 
+## Keyless Mode (`--keyless`)
+
+A single multi-statement job (`QueryBuilder.build_keyless_script()`, summarised by `generate_keyless_summary()`):
+
+```
+CREATE TEMP TABLE _kl AS
+  WITH ca AS (SELECT row_json AS row, COUNT(*) AS n FROM table_a GROUP BY row),
+       cb AS (... table_b ...)
+  SELECT row, n_a, n_b FROM ca FULL OUTER JOIN cb ON ca.row = cb.row
+
+SELECT SUM(LEAST(n_a, n_b))          AS rows_identical,
+       SUM(GREATEST(n_a - n_b, 0))   AS rows_only_in_a,   -- and the mirror for B
+       duplicate-row stats per side, up to 5 sample surplus rows per side
+FROM _kl
+```
+
+- **Row form.** `row_json` is `TO_JSON_STRING(STRUCT(<leaf path> AS <alias>, ...))` over the flattened supported columns, with ARRAY leaves in their canonical (sorted) form.
+- **Multiset counting.** Counting copies, rather than comparing distinct rows with `EXCEPT DISTINCT`, is what stops duplicates cancelling out.
+- **What's not produced.** There are no keys, so there are no per-column stats or tolerance. The verdict depends only on the only-in-A/B counts.
+
 ## STRUCT Handling
 
 Non-repeated STRUCT/RECORD fields are flattened at schema level by `_flatten_fields()` in `schema.py`:

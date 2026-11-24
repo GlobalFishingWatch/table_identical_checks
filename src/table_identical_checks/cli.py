@@ -27,6 +27,7 @@ from .backend import (
     build_verify_query,
     from_json_dict,
     generate_dimension_summary,
+    generate_keyless_summary,
     generate_summary,
     get_table_schema,
     resolve_snapshot_source,
@@ -65,6 +66,17 @@ def _parse_csv_names(raw: str | None) -> list[str] | None:
         return None
     names = [part.strip() for part in raw.split(",") if part.strip()]
     return names or None
+
+
+def _check_keyless_options(
+    table_a: str | None, table_b: str | None, conflicting: dict[str, object]
+) -> None:
+    """Reject options that need keys (or tolerance) when --keyless is set."""
+    given = [name for name, value in conflicting.items() if value]
+    if given:
+        raise click.UsageError(f"--keyless can't be combined with: {', '.join(given)}")
+    if not (table_a and table_b):
+        raise click.UsageError("--keyless needs --table-a and --table-b.")
 
 
 def _resolve_column_patterns(
@@ -1209,6 +1221,17 @@ def count(
         "names (e.g. '*_timestamp')."
     ),
 )
+@click.option(
+    "--keyless",
+    is_flag=True,
+    default=False,
+    help=(
+        "Compare whole rows without keys: identical-only (exact values, no "
+        "tolerance or per-column stats), duplicate-aware. Can't be combined "
+        "with --keys, tolerance, KLL, --write-diffs, --legacy, --max-diff-pct "
+        "or --expect-diff."
+    ),
+)
 def summary(
     table_a: str | None,
     table_b: str | None,
@@ -1238,17 +1261,39 @@ def summary(
     scratch_dataset: str | None,
     expect_diff: tuple[str, ...],
     ignore_columns: tuple[str, ...],
+    keyless: bool,
 ):
     """Generate a comprehensive comparison summary."""
-    # Interactive mode fills in the five most common params (table-a, table-b,
-    # keys, tolerance, format) when a TTY user runs the command with any
-    # required arg missing, or when they explicitly pass --interactive / -i.
-    # Non-TTY invocations with missing required args still fail loudly.
-    table_a, table_b, keys, tolerance, rel_tolerance, output_format = _prompt_common_params(
-        table_a, table_b, keys, tolerance, rel_tolerance, output_format, interactive
-    )
-
-    key_columns = [k.strip() for k in keys.split(",")]
+    if keyless:
+        _check_keyless_options(
+            table_a,
+            table_b,
+            {
+                "--keys": keys,
+                "--interactive": interactive,
+                "--tolerance": tolerance,
+                "--rel-tolerance": rel_tolerance,
+                "--kll-cols": kll_cols,
+                "--kll-int-cols": kll_int_cols,
+                "--write-diffs": write_diffs,
+                "--legacy": legacy,
+                "--max-diff-pct": max_diff_pct != 100.0,
+                "--expect-diff": expect_diff,
+            },
+        )
+        key_columns: list[str] = []
+    else:
+        # Interactive mode fills in the five most common params (table-a,
+        # table-b, keys, tolerance, format) when a TTY user runs the command
+        # with any required arg missing, or when they explicitly pass
+        # --interactive / -i. Non-TTY invocations with missing required args
+        # still fail loudly.
+        table_a, table_b, keys, tolerance, rel_tolerance, output_format = (
+            _prompt_common_params(
+                table_a, table_b, keys, tolerance, rel_tolerance, output_format, interactive
+            )
+        )
+        key_columns = [k.strip() for k in keys.split(",")]
 
     if credentials:
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials
@@ -1305,8 +1350,8 @@ def summary(
         client, effective_a, effective_b, partition_filter_a, partition_filter_b
     )
 
-    # Parse tolerance config
-    tolerance_config = _parse_tolerance(tolerance, rel_tolerance)
+    # Parse tolerance config (keyless mode compares exactly)
+    tolerance_config = None if keyless else _parse_tolerance(tolerance, rel_tolerance)
 
     builder = QueryBuilder(
         table_a=effective_a,
@@ -1356,14 +1401,18 @@ def summary(
         )
     )
 
-    mode = "legacy" if legacy else "pipeline"
+    mode = "keyless" if keyless else "legacy" if legacy else "pipeline"
     click.echo(f"Generating comparison summary ({mode} mode)...")
-    result = generate_summary(
-        client,
-        builder,
-        column_sort_order=sort_columns,
-        output_format=output_format,
-        pipeline_config=pipeline_config,
+    result = (
+        generate_keyless_summary(client, builder, output_format=output_format)
+        if keyless
+        else generate_summary(
+            client,
+            builder,
+            column_sort_order=sort_columns,
+            output_format=output_format,
+            pipeline_config=pipeline_config,
+        )
     )
     result.expected_diff_columns = expected
     result.ignored_columns = ignored
