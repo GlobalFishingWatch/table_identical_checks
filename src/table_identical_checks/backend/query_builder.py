@@ -888,11 +888,12 @@ class QueryBuilder:
 
         Sorts elements by their JSON representation and emits a deterministic JSON
         string. Two arrays with the same multiset of elements collapse to identical
-        byte sequences regardless of the original ordering.
+        byte sequences regardless of the original ordering. A NULL array stays
+        NULL: UNNEST(NULL) is empty, so it would otherwise collide with ``[]``.
         """
         return (
-            f"TO_JSON_STRING(ARRAY(SELECT e FROM UNNEST({ref}) AS e "
-            f"ORDER BY TO_JSON_STRING(e)))"
+            f"IF({ref} IS NULL, NULL, TO_JSON_STRING(ARRAY(SELECT e FROM UNNEST({ref}) AS e "
+            f"ORDER BY TO_JSON_STRING(e))))"
         )
 
     def _l1_array_eq(self, col_name: str) -> str:

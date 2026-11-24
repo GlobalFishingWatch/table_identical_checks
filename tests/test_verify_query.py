@@ -131,3 +131,17 @@ class TestVerifyQueryRuns:
         rows = list(bq_client.query(build_verify_query(summary)).result())
 
         assert [(r["which"], r["id"]) for r in rows] == [("missing_in_b", 2)]
+
+    def test_canonical_array_keeps_null_distinct_from_empty(self, bq_client):
+        """UNNEST(NULL) is empty, so NULL must not canonicalise to '[]'."""
+        canon = QueryBuilder._array_canonical_sql
+        sql = (
+            f"SELECT {canon('CAST(NULL AS ARRAY<INT64>)')} AS null_arr, "
+            f"{canon('CAST([] AS ARRAY<INT64>)')} AS empty_arr, "
+            f"{canon('[2, 1]')} AS arr"
+        )
+        row = next(iter(bq_client.query(sql).result()))
+
+        assert row["null_arr"] is None
+        assert row["empty_arr"] == "[]"
+        assert row["arr"] == "[1,2]"
