@@ -97,6 +97,8 @@ BQ_SCRATCH_DATASET=project.scratch_dataset \
 table-check summary ... --expect-diff='regions.*' --ignore-columns=created_at,'*_loaded_ts'
 ```
 
+`summary` (and `format`) exit `0` on PASS, `1` on FAIL and `2` on any error, so scripts and CI can use the exit status directly; see [Exit codes](docs/cli-reference.md#exit-codes).
+
 ### Companion commands
 
 Every `summary` invocation writes its result to a deterministic JSON path under

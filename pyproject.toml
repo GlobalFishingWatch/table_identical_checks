@@ -47,7 +47,7 @@ dev = [
 ]
 
 [project.scripts]
-table-check = "table_identical_checks.cli:main"
+table-check = "table_identical_checks.cli:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/table_identical_checks"]

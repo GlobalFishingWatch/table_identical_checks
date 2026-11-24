@@ -16,6 +16,18 @@ The `table-check` CLI has six commands. Shared conventions:
   BigQuery time travel. For deleted tables, restoration uses the scratch
   dataset specified by `--scratch-dataset` (or `$BQ_SCRATCH_DATASET`).
 
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | `summary` / `format`: verdict PASS. Other commands: succeeded |
+| `1` | `summary` / `format`: verdict FAIL (see [Verdict](#verdict)) |
+| `2` | Error: bad options, a missing file, a BigQuery error, any other crash (with a traceback on stderr), Ctrl-C, or output closed early (broken pipe) |
+
+Versions without this section exited 0 whatever the comparison found. Callers that treat any non-zero status as a crash need to accept `1` as "differences found".
+
+A pipx install must be reinstalled (`pipx reinstall table-identical-checks`) to pick up the new entry point. An editable install doesn't regenerate the `table-check` launcher.
+
 ## `table-check summary`
 
 Generate a comprehensive comparison summary as a single BigQuery

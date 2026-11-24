@@ -6,17 +6,20 @@ import json
 import os
 import re
 import sys
+import traceback
 from datetime import datetime, timezone
 from typing import Sequence
 
 import click
 import google.auth
+from google.api_core.exceptions import GoogleAPICallError
 from google.cloud import bigquery
 from tabulate import tabulate
 
 from .backend import (
     ColumnInfo,
     ColumnType,
+    ComparisonSummary,
     OutputDiffConfig,
     PipelineConfig,
     QueryBuilder,
@@ -677,8 +680,54 @@ def _display_diff_results(
 @click.group()
 @click.version_option()
 def main():
-    """Table Identical Checks - Compare BigQuery tables."""
+    """Table Identical Checks - Compare BigQuery tables.
+
+    Exit codes: 0 = PASS (or the command succeeded), 1 = FAIL (summary/format
+    verdict), 2 = error.
+    """
     pass
+
+
+EXIT_PASS, EXIT_FAIL, EXIT_ERROR = 0, 1, 2
+
+
+def _verdict_exit_code(summary_obj: ComparisonSummary) -> int:
+    return EXIT_PASS if summary_obj.verdict == "PASS" else EXIT_FAIL
+
+
+def run(argv: Sequence[str] | None = None) -> None:
+    """Console entry point: run the CLI and map its outcome to an exit code.
+
+    Commands that produce a verdict (summary, format) return 0 or 1; every
+    error exits 2, including uncaught exceptions such as BigQuery errors,
+    which would otherwise exit 1 and look like a FAIL. Commands signal
+    errors by raising (ClickException etc.), never by exiting 1 themselves.
+
+    With standalone_mode=False, click returns the exit code of --help and
+    --version instead of raising, so those arrive as a return value of 0.
+    """
+    try:
+        code = main.main(args=argv, standalone_mode=False)
+    except SystemExit as e:
+        # click exits 1 itself on a broken pipe (stdout closed early); any
+        # non-zero exit from inside a command is an error, not a FAIL.
+        sys.exit(EXIT_PASS if e.code in (0, None) else EXIT_ERROR)
+    except click.ClickException as e:  # includes UsageError
+        e.show()
+        sys.exit(EXIT_ERROR)
+    except click.exceptions.Abort:  # Ctrl-C, EOF at a prompt
+        click.echo("Aborted!", err=True)
+        sys.exit(EXIT_ERROR)
+    except GoogleAPICallError as e:  # the job message is enough
+        click.echo(f"Error: {type(e).__name__}: {e}", err=True)
+        sys.exit(EXIT_ERROR)
+    except Exception:  # noqa: BLE001 -- any crash must not read as FAIL
+        traceback.print_exc()
+        sys.exit(EXIT_ERROR)
+    # Only the verdict codes count; any other return value (None, True, ...)
+    # is a successful command.
+    is_verdict = type(code) is int and code in (EXIT_PASS, EXIT_FAIL)
+    sys.exit(code if is_verdict else EXIT_PASS)
 
 
 @main.command()
@@ -1334,6 +1383,8 @@ def summary(
             f"  B -> {output_diff_config.output_b}"
         )
 
+    return _verdict_exit_code(result)
+
 
 @main.command("format")
 @click.option("--input-json", required=True, help="Path to a summary JSON file")
@@ -1360,6 +1411,7 @@ def format_cmd(input_json: str, output_format: str | None, sort_columns: str | N
     if sort_columns:
         summary_obj.column_sort_order = sort_columns
     click.echo(str(summary_obj))
+    return _verdict_exit_code(summary_obj)
 
 
 @main.command("verify-query")
@@ -1469,4 +1521,4 @@ def breakdown(
 
 
 if __name__ == "__main__":
-    main()
+    run()
