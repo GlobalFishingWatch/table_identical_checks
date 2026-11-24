@@ -1,5 +1,6 @@
 """Command-line interface for table identical checks."""
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ from tabulate import tabulate
 
 from .backend import (
     ColumnInfo,
+    ColumnType,
     OutputDiffConfig,
     PipelineConfig,
     QueryBuilder,
@@ -60,6 +62,40 @@ def _parse_csv_names(raw: str | None) -> list[str] | None:
         return None
     names = [part.strip() for part in raw.split(",") if part.strip()]
     return names or None
+
+
+def _resolve_column_patterns(
+    option: str,
+    raw_values: Sequence[str],
+    column_names: Sequence[str],
+    key_columns: Sequence[str],
+) -> list[str]:
+    """Resolve repeatable, comma-separated glob patterns to column names.
+
+    Patterns match flattened names (``regions.*``, ``*_timestamp``); a bare
+    STRUCT name (``regions``) matches all of its fields. Key columns are
+    never matched: keys define the comparison and can't be ignored or
+    expected to differ, so a broad glob like ``*`` simply skips them. A
+    pattern that matches nothing else is an error (likely a typo, or only
+    keys).
+    """
+    keys = set(key_columns)
+    candidates = [c for c in column_names if c not in keys]
+
+    def matches(pattern: str) -> list[str]:
+        return [
+            c
+            for c in candidates
+            if fnmatch.fnmatchcase(c, pattern) or c.startswith(f"{pattern}.")
+        ]
+
+    patterns = [p for raw in raw_values for p in (_parse_csv_names(raw) or [])]
+    unmatched = [p for p in patterns if not matches(p)]
+    if unmatched:
+        raise click.ClickException(
+            f"{option}: no non-key column matches {', '.join(unmatched)}"
+        )
+    return sorted({c for p in patterns for c in matches(p)})
 
 
 def _parse_tolerance(tolerance: str | None, rel_tolerance: str | None) -> ToleranceConfig | None:
@@ -460,7 +496,24 @@ def _intersect_table_schemas(
     kll_float64_cols: Sequence[str] | None = None,
     kll_int64_cols: Sequence[str] | None = None,
 ) -> list[ColumnInfo]:
+    """Fetch both schemas and return the columns they share (see below)."""
+    return _intersect_table_schemas_with_drift(
+        client, table_a, table_b, key_columns, kll_float64_cols, kll_int64_cols
+    )[0]
+
+
+def _intersect_table_schemas_with_drift(
+    client: bigquery.Client,
+    table_a: str,
+    table_b: str,
+    key_columns: Sequence[str],
+    kll_float64_cols: Sequence[str] | None = None,
+    kll_int64_cols: Sequence[str] | None = None,
+) -> tuple[list[ColumnInfo], list[list[str]]]:
     """Fetch schemas from both tables, return the intersection on name+type.
+
+    Also returns the schema drift: ``[name, detail]`` for every column that
+    was dropped (present on one side only, or with a different type).
 
     Columns present in only one table, and columns whose ColumnType or bq_type
     differs between the two, are dropped from the comparison and reported via
@@ -537,7 +590,12 @@ def _intersect_table_schemas(
         click.secho("!" * 60, fg="yellow", bold=True)
         click.echo("")
 
-    return common
+    drift = [
+        *([c.name, f"only in A ({c.bq_type})"] for c in only_in_a),
+        *([c.name, f"only in B ({c.bq_type})"] for c in only_in_b),
+        *([ca.name, f"type A={ca.bq_type} B={cb.bq_type}"] for ca, cb in type_mismatches),
+    ]
+    return common, drift
 
 
 def _rows_to_dicts(rows: Sequence[bigquery.Row]) -> list[dict[str, object]]:
@@ -1081,6 +1139,27 @@ def count(
         "Restored tables expire after 7 days by default."
     ),
 )
+@click.option(
+    "--expect-diff",
+    "expect_diff",
+    multiple=True,
+    help=(
+        "Columns expected to differ: still compared and reported (status "
+        "EXPECT), but they never fail the verdict. Comma-separated and "
+        "repeatable; glob patterns match flattened names (e.g. 'regions.*')."
+    ),
+)
+@click.option(
+    "--ignore-columns",
+    "ignore_columns",
+    multiple=True,
+    help=(
+        "Columns to leave out of the comparison entirely, including schema "
+        "drift (columns in one table only). Ignored top-level columns aren't "
+        "read. Comma-separated and repeatable; glob patterns match flattened "
+        "names (e.g. '*_timestamp')."
+    ),
+)
 def summary(
     table_a: str | None,
     table_b: str | None,
@@ -1108,6 +1187,8 @@ def summary(
     snapshot_a: str | None,
     snapshot_b: str | None,
     scratch_dataset: str | None,
+    expect_diff: tuple[str, ...],
+    ignore_columns: tuple[str, ...],
 ):
     """Generate a comprehensive comparison summary."""
     # Interactive mode fills in the five most common params (table-a, table-b,
@@ -1136,7 +1217,7 @@ def summary(
         client, table_a, table_b, snapshot_a, snapshot_b, scratch_dataset
     )
 
-    columns = _intersect_table_schemas(
+    columns, schema_drift = _intersect_table_schemas_with_drift(
         client,
         effective_a,
         effective_b,
@@ -1144,6 +1225,31 @@ def summary(
         kll_float64_cols=kll_float_names,
         kll_int64_cols=kll_int_names,
     )
+
+    # Patterns match the union of both schemas, so a column that exists on
+    # one side only (schema drift) can be ignored or expected too.
+    column_names = [c.name for c in columns] + [name for name, _ in schema_drift]
+    ignored = _resolve_column_patterns(
+        "--ignore-columns", ignore_columns, column_names, key_columns
+    )
+    expected = _resolve_column_patterns(
+        "--expect-diff", expect_diff, column_names, key_columns
+    )
+    both = sorted(set(ignored) & set(expected))
+    if both:
+        raise click.ClickException(
+            f"Column(s) both ignored and expected to differ: {', '.join(both)}"
+        )
+    unsupported = sorted(
+        {c.name for c in columns if c.column_type == ColumnType.UNSUPPORTED} & set(expected)
+    )
+    if unsupported:
+        raise click.ClickException(
+            "--expect-diff: unsupported-type column(s) are never compared, "
+            f"use --ignore-columns instead: {', '.join(unsupported)}"
+        )
+    ignored_set = set(ignored)
+    columns = [c for c in columns if c.name not in ignored_set]
 
     # Get partition filters
     filter_a, filter_b = get_partition_filters(
@@ -1210,6 +1316,9 @@ def summary(
         output_format=output_format,
         pipeline_config=pipeline_config,
     )
+    result.expected_diff_columns = expected
+    result.ignored_columns = ignored
+    result.schema_drift = schema_drift
     click.echo("")
     click.echo(str(result))
 

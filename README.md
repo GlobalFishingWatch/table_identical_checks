@@ -91,6 +91,10 @@ TABLE_CHECK_OUTPUT_DATASET=project.scratch_dataset \
 # into BQ_SCRATCH_DATASET via the @<millis> decorator)
 BQ_SCRATCH_DATASET=project.scratch_dataset \
   table-check summary ... --snapshot-a=2026-05-08T12:00:00Z --snapshot-b=2026-05-08T12:00:00Z
+
+# Declare upfront what may change: expected columns are still reported but
+# don't fail the PASS/FAIL verdict; ignored columns aren't queried at all
+table-check summary ... --expect-diff='regions.*' --ignore-columns=created_at,'*_loaded_ts'
 ```
 
 ### Companion commands
