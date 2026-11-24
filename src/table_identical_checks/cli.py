@@ -6,11 +6,13 @@ import json
 import os
 import re
 import sys
+import traceback
 from datetime import datetime, timezone
 from typing import Sequence
 
 import click
 import google.auth
+from google.api_core.exceptions import GoogleAPICallError
 from google.cloud import bigquery
 from tabulate import tabulate
 
@@ -698,22 +700,34 @@ def run(argv: Sequence[str] | None = None) -> None:
 
     Commands that produce a verdict (summary, format) return 0 or 1; every
     error exits 2, including uncaught exceptions such as BigQuery errors,
-    which would otherwise exit 1 and look like a FAIL.
+    which would otherwise exit 1 and look like a FAIL. Commands signal
+    errors by raising (ClickException etc.), never by exiting 1 themselves.
+
+    With standalone_mode=False, click returns the exit code of --help and
+    --version instead of raising, so those arrive as a return value of 0.
     """
     try:
         code = main.main(args=argv, standalone_mode=False)
-    except click.exceptions.Exit as e:  # --help, --version
-        sys.exit(e.exit_code)
+    except SystemExit as e:
+        # click exits 1 itself on a broken pipe (stdout closed early); any
+        # non-zero exit from inside a command is an error, not a FAIL.
+        sys.exit(EXIT_PASS if e.code in (0, None) else EXIT_ERROR)
     except click.ClickException as e:  # includes UsageError
         e.show()
         sys.exit(EXIT_ERROR)
-    except click.exceptions.Abort:
+    except click.exceptions.Abort:  # Ctrl-C, EOF at a prompt
         click.echo("Aborted!", err=True)
         sys.exit(EXIT_ERROR)
-    except Exception as e:  # noqa: BLE001 -- any crash must not read as FAIL
+    except GoogleAPICallError as e:  # the job message is enough
         click.echo(f"Error: {type(e).__name__}: {e}", err=True)
         sys.exit(EXIT_ERROR)
-    sys.exit(code if isinstance(code, int) else EXIT_PASS)
+    except Exception:  # noqa: BLE001 -- any crash must not read as FAIL
+        traceback.print_exc()
+        sys.exit(EXIT_ERROR)
+    # Only the verdict codes count; any other return value (None, True, ...)
+    # is a successful command.
+    is_verdict = type(code) is int and code in (EXIT_PASS, EXIT_FAIL)
+    sys.exit(code if is_verdict else EXIT_PASS)
 
 
 @main.command()
