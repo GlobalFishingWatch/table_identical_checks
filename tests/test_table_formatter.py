@@ -652,8 +652,9 @@ class TestColumnNameTruncation:
             },
             column_types={long_name: ColumnType.FLOAT},
         )
-        output = str(s)
-        # The full name should not appear; instead a truncated version should
+        # The column table shows a truncated name (the VERDICT line below it
+        # lists failing columns by their full name on purpose)
+        output = str(s).split("VERDICT:")[0]
         assert long_name not in output
         # The unicode ellipsis should be present
         assert "\u2026" in output

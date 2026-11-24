@@ -45,6 +45,17 @@ multi-statement job.
 | `--expiration-hours` | INT | `168` | TTL for diff-output tables (7 days). Pass `0` to disable expiration |
 | `--snapshot-a` / `--snapshot-b` | TEXT | None | ISO 8601 timestamp; read the side via BQ time travel |
 | `--scratch-dataset` | TEXT | `$BQ_SCRATCH_DATASET` | `project.dataset` for restoring deleted snapshot tables |
+| `--expect-diff` | TEXT (repeatable) | None | Columns expected to differ. They are still compared and reported (status `EXPECT`), but never fail the verdict. Comma-separated glob patterns over flattened names, e.g. `regions.*` |
+| `--ignore-columns` | TEXT (repeatable) | None | Columns left out of the comparison entirely. They aren't queried, so they cost no bytes. Same pattern syntax |
+
+### Verdict
+
+Every summary ends with `VERDICT: PASS` or `VERDICT: FAIL (...)`. The JSON output has a matching `verdict` field plus a `failing_columns` list.
+
+- **FAIL** when a row exists on one side only, or when rows differ in a column not listed in `--expect-diff`. Differences within tolerance don't count.
+- **PASS** otherwise, including when the only differences are in expected columns.
+- **Pattern errors:** a pattern that matches no column is an error, to catch typos, and so is a pattern that matches a key column.
+- **Expected but identical:** a column listed in `--expect-diff` that turns out identical is reported as a note, not a failure.
 
 ## `table-check diff`
 

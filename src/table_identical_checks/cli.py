@@ -1,5 +1,6 @@
 """Command-line interface for table identical checks."""
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -60,6 +61,32 @@ def _parse_csv_names(raw: str | None) -> list[str] | None:
         return None
     names = [part.strip() for part in raw.split(",") if part.strip()]
     return names or None
+
+
+def _resolve_column_patterns(
+    option: str,
+    raw_values: Sequence[str],
+    column_names: Sequence[str],
+    key_columns: Sequence[str],
+) -> list[str]:
+    """Resolve repeatable, comma-separated glob patterns to column names.
+
+    Patterns match flattened names (``regions.*``, ``*_timestamp``). A pattern
+    that matches no column is an error (likely a typo), as is one that matches
+    a key column: keys define the comparison and can't be ignored or expected
+    to differ.
+    """
+    patterns = [p for raw in raw_values for p in (_parse_csv_names(raw) or [])]
+    unmatched = [p for p in patterns if not fnmatch.filter(column_names, p)]
+    if unmatched:
+        raise click.ClickException(
+            f"{option}: no column matches {', '.join(unmatched)}"
+        )
+    matched = sorted({c for p in patterns for c in fnmatch.filter(column_names, p)})
+    keys = [c for c in matched if c in key_columns]
+    if keys:
+        raise click.ClickException(f"{option}: key column(s) can't be used: {', '.join(keys)}")
+    return matched
 
 
 def _parse_tolerance(tolerance: str | None, rel_tolerance: str | None) -> ToleranceConfig | None:
@@ -1081,6 +1108,26 @@ def count(
         "Restored tables expire after 7 days by default."
     ),
 )
+@click.option(
+    "--expect-diff",
+    "expect_diff",
+    multiple=True,
+    help=(
+        "Columns expected to differ: still compared and reported (status "
+        "EXPECT), but they never fail the verdict. Comma-separated and "
+        "repeatable; glob patterns match flattened names (e.g. 'regions.*')."
+    ),
+)
+@click.option(
+    "--ignore-columns",
+    "ignore_columns",
+    multiple=True,
+    help=(
+        "Columns to leave out of the comparison entirely (not queried, so "
+        "they cost no bytes). Comma-separated and repeatable; glob patterns "
+        "match flattened names (e.g. '*_timestamp')."
+    ),
+)
 def summary(
     table_a: str | None,
     table_b: str | None,
@@ -1108,6 +1155,8 @@ def summary(
     snapshot_a: str | None,
     snapshot_b: str | None,
     scratch_dataset: str | None,
+    expect_diff: tuple[str, ...],
+    ignore_columns: tuple[str, ...],
 ):
     """Generate a comprehensive comparison summary."""
     # Interactive mode fills in the five most common params (table-a, table-b,
@@ -1144,6 +1193,20 @@ def summary(
         kll_float64_cols=kll_float_names,
         kll_int64_cols=kll_int_names,
     )
+
+    column_names = [c.name for c in columns]
+    ignored = _resolve_column_patterns(
+        "--ignore-columns", ignore_columns, column_names, key_columns
+    )
+    expected = _resolve_column_patterns(
+        "--expect-diff", expect_diff, column_names, key_columns
+    )
+    both = sorted(set(ignored) & set(expected))
+    if both:
+        raise click.ClickException(
+            f"Column(s) both ignored and expected to differ: {', '.join(both)}"
+        )
+    columns = [c for c in columns if c.name not in set(ignored)]
 
     # Get partition filters
     filter_a, filter_b = get_partition_filters(
@@ -1210,6 +1273,8 @@ def summary(
         output_format=output_format,
         pipeline_config=pipeline_config,
     )
+    result.expected_diff_columns = expected
+    result.ignored_columns = ignored
     click.echo("")
     click.echo(str(result))
 
