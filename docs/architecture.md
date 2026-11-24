@@ -74,23 +74,26 @@ The original multi-query approach. Executes 2 + N queries where N is the number 
 
 ## Keyless Mode (`--keyless`)
 
-A single multi-statement job (`QueryBuilder.build_keyless_script()`, summarised by `generate_keyless_summary()`):
+A single query (`QueryBuilder.build_keyless_script()`, summarised by `generate_keyless_summary()`):
 
 ```
-CREATE TEMP TABLE _kl AS
-  WITH ca AS (SELECT row_json AS row, COUNT(*) AS n FROM table_a GROUP BY row),
-       cb AS (... table_b ...)
-  SELECT row, n_a, n_b FROM ca FULL OUTER JOIN cb ON ca.row = cb.row
-
+WITH ca  AS (SELECT row_json AS row, COUNT(*) AS n FROM table_a AS t GROUP BY row),
+     cb  AS (... table_b ...),
+     _kl AS (SELECT row, n_a, n_b FROM ca FULL OUTER JOIN cb ON ca.row = cb.row)
 SELECT SUM(LEAST(n_a, n_b))          AS rows_identical,
        SUM(GREATEST(n_a - n_b, 0))   AS rows_only_in_a,   -- and the mirror for B
-       duplicate-row stats per side, up to 5 sample surplus rows per side
+       duplicate-row stats per side,
+       ARRAY_AGG(... IGNORE NULLS ORDER BY row LIMIT 5)   -- sample surplus rows
 FROM _kl
 ```
 
-- **Row form.** `row_json` is `TO_JSON_STRING(STRUCT(<leaf path> AS <alias>, ...))` over the flattened supported columns, with ARRAY leaves in their canonical (sorted) form.
+- **Row form.** `row_json` is `TO_JSON_STRING(STRUCT(...))` over the flattened supported columns, each qualified with the source alias `t`. It's normalised to agree with keyed mode:
+  - ARRAY leaves use the canonical (sorted) form, and NULL stays NULL;
+  - FLOAT leaves add `0.0`, so `-0.0` matches `0.0`;
+  - every STRUCT gets an `IS NULL` flag, so a NULL STRUCT differs from a STRUCT of NULLs.
 - **Multiset counting.** Counting copies, rather than comparing distinct rows with `EXCEPT DISTINCT`, is what stops duplicates cancelling out.
-- **What's not produced.** There are no keys, so there are no per-column stats or tolerance. The verdict depends only on the only-in-A/B counts.
+- **Cost.** It's a single query, not a script with a temp table, so the serialised rows are never re-read and billed again. The GROUP BY over JSON strings does cost more slot time than the keyed pipeline.
+- **What's not produced.** There are no keys, so there are no per-column stats or tolerance. The verdict depends on the only-in-A/B counts, duplicate rows and schema drift.
 
 ## STRUCT Handling
 

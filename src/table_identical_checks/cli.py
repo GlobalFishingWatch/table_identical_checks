@@ -1344,6 +1344,11 @@ def summary(
         )
     ignored_set = set(ignored)
     columns = [c for c in columns if c.name not in ignored_set]
+    if keyless and not any(c.column_type != ColumnType.UNSUPPORTED for c in columns):
+        # Every row would serialise to '{}', so any equal-sized tables PASS.
+        raise click.ClickException(
+            "--keyless: no comparable columns left (all ignored or unsupported)."
+        )
 
     # Get partition filters
     filter_a, filter_b = get_partition_filters(
@@ -1475,6 +1480,13 @@ def verify_query_cmd(input_json: str):
     with open(input_json) as f:
         data = json.load(f)
     summary_obj = from_json_dict(data)
+    if summary_obj.keyless:
+        # EXCEPT DISTINCT compares distinct rows, so it can't confirm (and
+        # would contradict) keyless counts that hinge on duplicate copies.
+        raise click.ClickException(
+            "verify-query doesn't support keyless summaries: EXCEPT DISTINCT "
+            "ignores duplicate rows, which keyless mode counts."
+        )
     click.echo(build_verify_query(summary_obj))
 
 

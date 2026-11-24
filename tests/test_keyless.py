@@ -14,6 +14,7 @@ from table_identical_checks.backend import (
     generate_keyless_summary,
     get_table_schema,
 )
+from table_identical_checks.backend.summary import ComparisonSummary, to_json_dict
 from table_identical_checks.cli import run
 
 
@@ -36,14 +37,15 @@ class TestKeylessSql:
     def test_row_selects_leaves_and_canonicalises_arrays(self):
         row = _builder()._keyless_row_sql()
 
-        assert row.startswith("TO_JSON_STRING(STRUCT(`id` AS `id`, ")
+        assert row.startswith("TO_JSON_STRING(STRUCT(t.`id` AS `id`, ")
         assert (
-            QueryBuilder._array_canonical_sql("`outer`.`tags`") + " AS `outer__tags`"
+            QueryBuilder._array_canonical_sql("t.`outer`.`tags`") + " AS `outer__tags`"
         ) in row
-        assert "`outer`.`score` AS `outer__score`" in row
+        assert "(t.`outer`.`score` + 0.0) AS `outer__score`" in row
+        assert "t.`outer` IS NULL AS `outer__is_null`" in row
         assert "blob" not in row
 
-    def test_script_counts_multisets(self):
+    def test_script_counts_multisets_in_one_query(self):
         script = _builder(partition_filter_b="id > 0").build_keyless_script()
 
         assert "COUNT(*) AS n FROM `p.d.a` AS t GROUP BY row" in script
@@ -51,6 +53,32 @@ class TestKeylessSql:
         assert "ON ca.row = cb.row" in script
         assert "SUM(GREATEST(n_a - n_b, 0)), 0) AS rows_only_in_a" in script
         assert "SUM(LEAST(n_a, n_b)), 0) AS rows_identical" in script
+        # No temp table: the serialised rows aren't read (and billed) twice
+        assert "TEMP TABLE" not in script
+        assert "IGNORE NULLS ORDER BY row LIMIT 5" in script
+
+    def test_verify_query_refuses_keyless_json(self, tmp_path, capsys):
+        summary = ComparisonSummary(
+            table_a="p.d.a",
+            table_b="p.d.b",
+            key_columns=[],
+            rows_only_in_a=1,
+            rows_only_in_b=1,
+            rows_in_both_with_differences=0,
+            rows_identical=2,
+            total_rows_a=3,
+            total_rows_b=3,
+            numeric_column_stats={},
+            string_column_mismatches={},
+            keyless=True,
+        )
+        path = tmp_path / "keyless.json"
+        path.write_text(json.dumps(to_json_dict(summary), default=str))
+
+        assert _exit_code(["verify-query", f"--input-json={path}"]) == 2
+        assert "doesn't support keyless" in capsys.readouterr().err
+        # format round-trips keyless JSON and keeps its verdict exit code
+        assert _exit_code(["format", f"--input-json={path}"]) == 1
 
 
 def _exit_code(argv: list[str]) -> int:
@@ -110,6 +138,50 @@ class TestKeylessEndToEnd:
             columns=get_table_schema(bq_client, table_a),
         )
         return generate_keyless_summary(bq_client, builder)
+
+    def test_null_struct_differs_from_struct_of_nulls(self, bq_client, table_factory):
+        """Stored arrays are never NULL, but arrays inside a NULL STRUCT are."""
+        rows_a = [{"id": 1, "tags": [], "outer": None}]
+        rows_b = [{"id": 1, "tags": [], "outer": {"label": None, "codes": []}}]
+        summary = self._summary(bq_client, table_factory, rows_a, rows_b)
+
+        assert (summary.rows_only_in_a, summary.rows_only_in_b) == (1, 1)
+
+    def test_negative_zero_equals_zero(self, bq_client, table_factory):
+        schema = [bigquery.SchemaField("id", "INT64"), bigquery.SchemaField("val", "FLOAT64")]
+        table_a = table_factory(schema, [{"id": 1, "val": -0.0}])
+        table_b = table_factory(schema, [{"id": 1, "val": 0.0}])
+        builder = QueryBuilder(
+            table_a=table_a,
+            table_b=table_b,
+            key_columns=[],
+            columns=get_table_schema(bq_client, table_a),
+        )
+        summary = generate_keyless_summary(bq_client, builder)
+
+        assert summary.rows_identical == 1
+        assert summary.verdict == "PASS"
+
+    def test_empty_tables_pass(self, bq_client, table_factory):
+        summary = self._summary(bq_client, table_factory, [], [])
+
+        assert (summary.total_rows_a, summary.total_rows_b) == (0, 0)
+        assert summary.sample_rows == []
+        assert summary.verdict == "PASS"
+
+    def test_nothing_to_compare_is_an_error(self, table_factory, capsys):
+        table_a = table_factory(SCHEMA, [_row(1)])
+        table_b = table_factory(SCHEMA, [_row(2)])
+        argv = [
+            "summary",
+            "--keyless",
+            f"--table-a={table_a}",
+            f"--table-b={table_b}",
+            "--ignore-columns=*",
+        ]
+
+        assert _exit_code(argv) == 2
+        assert "no comparable columns left" in capsys.readouterr().err
 
     def test_compensating_duplicates_are_caught(self, bq_client, table_factory):
         """{X, X, Y} vs {X, Y, Y}: equal counts, but not the same rows."""

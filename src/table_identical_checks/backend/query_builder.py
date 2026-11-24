@@ -814,32 +814,52 @@ class QueryBuilder:
     def _keyless_row_sql(self) -> str:
         """One row serialised as a JSON string, for keyless (identical-only) mode.
 
-        Every supported column is selected by its flattened path, so STRUCTs
-        don't need to match field-for-field, and ARRAYs use the same
-        order-insensitive canonical form as the keyed comparison. Floats and
-        geographies compare by their exact JSON representation.
+        Every supported column is selected by its flattened path, qualified
+        with the source alias ``t`` (so a column named ``t`` can't resolve to
+        the whole row), and STRUCTs don't need to match field-for-field.
+        Normalisation, so keyless agrees with the keyed comparison:
+
+        - ARRAYs use the order-insensitive canonical form (NULL stays NULL);
+        - FLOATs add 0.0, which turns -0.0 into 0.0 (they're equal in SQL);
+        - each STRUCT gets an ``IS NULL`` flag, so a NULL STRUCT doesn't
+          serialise like a STRUCT whose fields are all NULL.
+
+        GEOGRAPHY compares by its text form, which is stricter than ST_EQUALS.
         """
         def field(col: ColumnInfo) -> str:
-            path = self._quote_path(col.name)
-            expr = (
-                self._array_canonical_sql(path)
-                if col.column_type == ColumnType.ARRAY
-                else path
-            )
+            path = f"t.{self._quote_path(col.name)}"
+            if col.column_type == ColumnType.ARRAY:
+                expr = self._array_canonical_sql(path)
+            elif col.column_type == ColumnType.FLOAT:
+                expr = f"({path} + 0.0)"
+            else:
+                expr = path
             return f"{expr} AS `{self._safe_alias(col.name)}`"
 
-        fields = ", ".join(map(field, self._supported_columns()))
+        columns = self._supported_columns()
+        struct_paths = dict.fromkeys(
+            ".".join(parts[:depth])
+            for parts in (c.name.split(".") for c in columns)
+            for depth in range(1, len(parts))
+        )
+        null_flags = [
+            f"t.{self._quote_path(p)} IS NULL AS `{self._safe_alias(p)}__is_null`"
+            for p in struct_paths
+        ]
+        fields = ", ".join([*map(field, columns), *null_flags])
         return f"TO_JSON_STRING(STRUCT({fields}))"
 
     def build_keyless_script(self, sample_limit: int = 5) -> str:
-        """Build the keyless, identical-only comparison as one multi-statement job.
+        """Build the keyless, identical-only comparison as a single query.
 
         Rows are compared as multisets: each distinct serialised row is
         counted per side (``n_a``, ``n_b``). Surplus copies on one side count
         as only-in-that-side, so duplicates can't cancel out: ``{X, X, Y}``
         against ``{X, Y, Y}`` is one row only in A and one only in B. The
         result row also carries duplicate-row stats per side and up to
-        ``sample_limit`` surplus rows per side.
+        ``sample_limit`` surplus rows per side. The samples are aggregated
+        in the same pass (no temp table), so the serialised rows aren't read
+        and billed a second time.
         """
         row = self._keyless_row_sql()
         source_a = self._table_source(self.table_a, "t", self.partition_filter_a)
@@ -847,23 +867,22 @@ class QueryBuilder:
 
         def samples(side: str, condition: str) -> str:
             return (
-                f"ARRAY(SELECT AS STRUCT '{side}' AS side, row, n_a, n_b FROM _kl "
-                f"WHERE {condition} ORDER BY row LIMIT {sample_limit})"
+                f"IFNULL(ARRAY_AGG(IF({condition}, STRUCT('{side}' AS side, row, n_a, n_b), "
+                f"NULL) IGNORE NULLS ORDER BY row LIMIT {sample_limit}), [])"
             )
 
         return (
-            "CREATE TEMP TABLE _kl AS\n"
             "WITH ca AS (\n"
             f"  SELECT {row} AS row, COUNT(*) AS n FROM {source_a} GROUP BY row\n"
             "), cb AS (\n"
             f"  SELECT {row} AS row, COUNT(*) AS n FROM {source_b} GROUP BY row\n"
-            ")\n"
-            "SELECT COALESCE(ca.row, cb.row) AS row, IFNULL(ca.n, 0) AS n_a, "
+            "), _kl AS (\n"
+            "  SELECT COALESCE(ca.row, cb.row) AS row, IFNULL(ca.n, 0) AS n_a, "
             "IFNULL(cb.n, 0) AS n_b\n"
-            "FROM ca\n"
-            "FULL OUTER JOIN cb\n"
-            "  ON ca.row = cb.row;\n"
-            "\n"
+            "  FROM ca\n"
+            "  FULL OUTER JOIN cb\n"
+            "    ON ca.row = cb.row\n"
+            ")\n"
             "SELECT\n"
             "  IFNULL(SUM(n_a), 0) AS total_rows_a,\n"
             "  IFNULL(SUM(n_b), 0) AS total_rows_b,\n"
@@ -878,7 +897,7 @@ class QueryBuilder:
             "  IFNULL(MAX(IF(n_b > 1, n_b, NULL)), 0) AS max_dupe_count_b,\n"
             f"  ARRAY_CONCAT({samples('only_in_a', 'n_a > n_b')}, "
             f"{samples('only_in_b', 'n_b > n_a')}) AS samples\n"
-            "FROM _kl;\n"
+            "FROM _kl\n"
         )
 
     def get_table_objects(self) -> tuple[Selectable, Selectable]:
