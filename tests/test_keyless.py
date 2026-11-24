@@ -91,7 +91,9 @@ def _exit_code(argv: list[str]) -> int:
     "extra",
     [
         ["--keys=id"],
+        ["--keys="],
         ["--tolerance=1e-9"],
+        ["--tolerance="],
         ["--expect-diff=score"],
         ["--write-diffs"],
         ["--legacy"],

@@ -71,8 +71,15 @@ def _parse_csv_names(raw: str | None) -> list[str] | None:
 def _check_keyless_options(
     table_a: str | None, table_b: str | None, conflicting: dict[str, object]
 ) -> None:
-    """Reject options that need keys (or tolerance) when --keyless is set."""
-    given = [name for name, value in conflicting.items() if value]
+    """Reject options that need keys (or tolerance) when --keyless is set.
+
+    An option counts as given unless it is unset (None), an unset flag
+    (False) or an empty repeatable (()), so an explicit ``--keys=`` is
+    rejected too.
+    """
+    given = [
+        name for name, value in conflicting.items() if value not in (None, False, ())
+    ]
     if given:
         raise click.UsageError(f"--keyless can't be combined with: {', '.join(given)}")
     if not (table_a and table_b):
