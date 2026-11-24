@@ -45,17 +45,28 @@ multi-statement job.
 | `--expiration-hours` | INT | `168` | TTL for diff-output tables (7 days). Pass `0` to disable expiration |
 | `--snapshot-a` / `--snapshot-b` | TEXT | None | ISO 8601 timestamp; read the side via BQ time travel |
 | `--scratch-dataset` | TEXT | `$BQ_SCRATCH_DATASET` | `project.dataset` for restoring deleted snapshot tables |
-| `--expect-diff` | TEXT (repeatable) | None | Columns expected to differ. They are still compared and reported (status `EXPECT`), but never fail the verdict. Comma-separated glob patterns over flattened names, e.g. `regions.*` |
-| `--ignore-columns` | TEXT (repeatable) | None | Columns left out of the comparison entirely. They aren't queried, so they cost no bytes. Same pattern syntax |
+| `--expect-diff` | TEXT (repeatable) | None | Columns expected to differ. They are still compared and reported (status `EXPECT`), but never fail the verdict. Comma-separated glob patterns over flattened names, e.g. `regions.*`. A bare STRUCT name (`regions`) matches all its fields |
+| `--ignore-columns` | TEXT (repeatable) | None | Columns left out of the comparison entirely. Same pattern syntax. A top-level column that is ignored isn't read at all. Ignoring only some fields of a STRUCT still reads the STRUCT, because the other fields are compared. `--write-diffs` copies whole rows regardless |
 
 ### Verdict
 
-Every summary ends with `VERDICT: PASS` or `VERDICT: FAIL (...)`. The JSON output has a matching `verdict` field plus a `failing_columns` list.
+Every summary ends with `VERDICT: PASS` or `VERDICT: FAIL (...)`. The JSON output has a matching `verdict` field, a `failing_columns` list and a `fail_reasons` list.
 
-- **FAIL** when a row exists on one side only, or when rows differ in a column not listed in `--expect-diff`. Differences within tolerance don't count.
-- **PASS** otherwise, including when the only differences are in expected columns.
-- **Pattern errors:** a pattern that matches no column is an error, to catch typos, and so is a pattern that matches a key column.
-- **Expected but identical:** a column listed in `--expect-diff` that turns out identical is reported as a note, not a failure.
+The verdict is **FAIL** when any of these holds:
+- a row exists on one side only;
+- the row totals or the duplicate structure differ, for example an extra copy of a duplicated key whose values all match;
+- rows differ in a column not listed in `--expect-diff` (differences within tolerance don't count);
+- rows differ but no column shows the difference. That's never assumed to be expected;
+- **schema drift**: a column exists in one table only, or has a different type, and isn't matched by `--ignore-columns` or `--expect-diff`. Patterns match the union of both schemas, so a column added in B can be ignored.
+
+Otherwise the verdict is **PASS**, including when the only differences are in expected columns.
+
+Notes:
+- **Keys:** key columns are never matched, so a broad glob like `*` skips them. A pattern that matches nothing else is an error, to catch typos.
+- **Unsupported types:** unsupported-type columns can't be expected to differ, because they're never compared. Use `--ignore-columns` for them.
+- **Expected columns without differences:** a column listed in `--expect-diff` that shows no differences beyond tolerance is reported as a note, not a failure.
+- **Aborted runs:** when the circuit breaker aborts, the verdict uses Layer 1's pre-tolerance counts and says so.
+- **Older versions:** JSON files written by this version carry `verdict`, `failing_columns` and `fail_reasons`, which older `table-check format` / `verify-query` versions can't load.
 
 ## `table-check diff`
 

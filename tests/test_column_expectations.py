@@ -9,7 +9,7 @@ import pytest
 from click.testing import CliRunner
 from google.cloud import bigquery
 
-from table_identical_checks.backend import ColumnType, build_verify_query
+from table_identical_checks.backend import ColumnType, DuplicateInfo, build_verify_query
 from table_identical_checks.backend.summary import (
     ComparisonSummary,
     from_json_dict,
@@ -31,12 +31,21 @@ class TestResolveColumnPatterns:
         assert _resolve_column_patterns("--expect-diff", (), COLUMNS, ["id"]) == []
 
     def test_unmatched_pattern_is_an_error(self):
-        with pytest.raises(click.ClickException, match="no column matches regionz"):
+        with pytest.raises(click.ClickException, match="no non-key column matches regionz"):
             _resolve_column_patterns("--expect-diff", ("regionz.*",), COLUMNS, ["id"])
 
-    def test_key_column_is_an_error(self):
-        with pytest.raises(click.ClickException, match="key column.*id"):
+    def test_pattern_matching_only_keys_is_an_error(self):
+        with pytest.raises(click.ClickException, match="no non-key column matches i\\*"):
             _resolve_column_patterns("--ignore-columns", ("i*",), COLUMNS, ["id"])
+
+    def test_broad_glob_skips_keys(self):
+        resolved = _resolve_column_patterns("--expect-diff", ("*",), COLUMNS, ["id"])
+        assert "id" not in resolved
+        assert len(resolved) == len(COLUMNS) - 1
+
+    def test_bare_struct_name_matches_its_fields(self):
+        resolved = _resolve_column_patterns("--ignore-columns", ("regions",), COLUMNS, ["id"])
+        assert resolved == ["regions.eez", "regions.fao"]
 
 
 def _summary(**kwargs) -> ComparisonSummary:
@@ -119,6 +128,59 @@ class TestVerdict:
         summary = _summary(column_diff_counts={}, expected_diff_columns=["name"])
         assert summary.failing_columns == ["score"]
 
+    def test_legacy_zero_delta_stats_are_not_differences(self):
+        """Legacy stats cover every differing row, so identical columns show 0."""
+        summary = _summary(
+            column_diff_counts={},
+            numeric_column_stats={"score": {"max_abs_delta": 0.0}},
+            expected_diff_columns=["name"],
+        )
+        assert summary.differing_columns == ["name"]
+        assert summary.verdict == "PASS"
+
+    def test_unattributed_differences_fail(self):
+        """Rows differ but no column shows it (e.g. legacy NULL vs value)."""
+        summary = _summary(
+            column_diff_counts={},
+            numeric_column_stats={},
+            string_column_mismatches={},
+        )
+        assert summary.differing_columns == []
+        assert summary.verdict == "FAIL"
+        assert "2 rows differ in no identifiable column" in summary.fail_reasons
+
+    def test_extra_duplicate_with_matching_values_fails(self):
+        """B has key 1 twice with the same values: no only-in rows, no value diffs."""
+        summary = _summary(
+            rows_in_both_with_differences=0,
+            column_diff_counts={"name": 0, "score": 0, "value": 0},
+            total_rows_b=11,
+            duplicate_info_a=DuplicateInfo(0, 0, 0),
+            duplicate_info_b=DuplicateInfo(1, 2, 2),
+        )
+        assert summary.fail_reasons == [
+            "row totals differ (10 vs 11)",
+            "duplicate rows differ (0 vs 2)",
+        ]
+
+    def test_schema_drift_fails_unless_accounted_for(self):
+        drift = [["new_col", "only in B (INT64)"], ["kind", "type A=INT64 B=STRING"]]
+        summary = _summary(
+            schema_drift=drift, expected_diff_columns=["name", "score", "kind"]
+        )
+        assert summary.fail_reasons == ["schema drift: new_col"]
+
+        summary.ignored_columns = ["new_col"]
+        assert summary.verdict == "PASS"
+
+    def test_aborted_reason_says_pre_tolerance(self):
+        summary = _summary(
+            pipeline_aborted=True, numeric_column_stats={}, string_column_mismatches={}
+        )
+        assert summary.fail_reasons == [
+            "unexpected differences in: name, score (pipeline aborted: pre-tolerance counts)"
+        ]
+
 
 class TestOutput:
     def test_json_round_trip_and_derived_fields(self):
@@ -152,7 +214,12 @@ class TestOutput:
         text = str(summary)
 
         assert "VERDICT: PASS" in text
-        assert "Note: expected to differ but identical: value" in text
+        assert "Note: expected to differ but no differences beyond tolerance: value" in text
+
+    def test_schema_drift_is_listed(self):
+        text = str(_summary(schema_drift=[["new_col", "only in B (INT64)"]]))
+        assert "Schema drift: new_col (only in B (INT64))" in text
+        assert "schema drift: new_col" in text
 
     def test_verify_query_lists_ignored_columns(self):
         sql = build_verify_query(_summary(ignored_columns=["created_ts"]))
@@ -197,3 +264,29 @@ class TestSummaryCli:
         assert data["ignored_columns"] == ["loaded_at"]
         assert "loaded_at" not in data["column_types"]
         assert "VERDICT: PASS" in result.output
+
+    def test_schema_drift_end_to_end(self, table_factory, tmp_path):
+        """B has an extra column: FAIL unless it is ignored."""
+        row = {"id": 1, "name": "x", "score": 1.0, "loaded_at": "2026-01-01T00:00:00Z"}
+        table_a = table_factory(SCHEMA, [row])
+        table_b = table_factory(
+            [*SCHEMA, bigquery.SchemaField("added", "INT64")], [{**row, "added": 7}]
+        )
+        out = tmp_path / "summary.json"
+        base = [
+            "summary",
+            f"--table-a={table_a}",
+            f"--table-b={table_b}",
+            "--keys=id",
+            f"--output-json={out}",
+        ]
+
+        CliRunner().invoke(main, base)
+        data = json.loads(out.read_text())
+        assert data["verdict"] == "FAIL"
+        assert data["schema_drift"] == [["added", "only in B (INTEGER)"]]
+        assert data["fail_reasons"] == ["schema drift: added"]
+
+        result = CliRunner().invoke(main, [*base, "--ignore-columns=added"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(out.read_text())["verdict"] == "PASS"

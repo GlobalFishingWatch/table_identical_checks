@@ -151,26 +151,24 @@ def _format_aborted_warning(summary: "ComparisonSummary") -> list[str]:
 
 def _format_verdict(summary: "ComparisonSummary") -> list[str]:
     """Return the PASS/FAIL line, plus notes on expected and ignored columns."""
-    if summary.verdict == "FAIL":
-        reasons = [
-            *([f"{summary.rows_only_in_a:,} rows only in A"] if summary.rows_only_in_a else []),
-            *([f"{summary.rows_only_in_b:,} rows only in B"] if summary.rows_only_in_b else []),
-            *(
-                [f"unexpected differences in: {', '.join(summary.failing_columns)}"]
-                if summary.rows_in_both_with_differences and summary.failing_columns
-                else []
-            ),
-        ]
-        lines = [f"VERDICT: FAIL ({'; '.join(reasons)})"]
-    else:
-        lines = ["VERDICT: PASS"]
+    reasons = summary.fail_reasons
+    lines = [f"VERDICT: FAIL ({'; '.join(reasons)})" if reasons else "VERDICT: PASS"]
 
-    differing = set(summary.differing_columns)
+    if summary.schema_drift:
+        lines.append(
+            "Schema drift: "
+            + ", ".join(f"{name} ({detail})" for name, detail in summary.schema_drift)
+        )
+
+    differing = {*summary.differing_columns, *(name for name, _ in summary.schema_drift)}
     unchanged = [c for c in summary.expected_diff_columns if c not in differing]
     if summary.expected_diff_columns:
         lines.append(f"Expected to differ: {', '.join(summary.expected_diff_columns)}")
     if unchanged:
-        lines.append(f"Note: expected to differ but identical: {', '.join(unchanged)}")
+        lines.append(
+            "Note: expected to differ but no differences beyond tolerance: "
+            + ", ".join(unchanged)
+        )
     if summary.ignored_columns:
         lines.append(f"Ignored (not compared): {', '.join(summary.ignored_columns)}")
     return lines
@@ -911,6 +909,11 @@ class ComparisonSummary:
     # Columns dropped before querying (--ignore-columns): not compared at all.
     ignored_columns: list[str] = field(default_factory=list)
 
+    # Columns the schema intersection dropped: [name, detail] pairs, e.g.
+    # ["new_col", "only in B (INT64)"]. They fail the verdict unless ignored
+    # or expected to differ.
+    schema_drift: list[list[str]] = field(default_factory=list)
+
     @property
     def total_differences(self) -> int:
         return self.rows_only_in_a + self.rows_only_in_b + self.rows_in_both_with_differences
@@ -923,15 +926,18 @@ class ComparisonSummary:
         other column differs if Layer 1 counted a difference. An aborted
         pipeline only has Layer 1's (pre-tolerance) counts, so it falls back
         to those. The legacy path has no per-column counts and falls back to
-        the per-type stat dicts, which only hold columns with differences.
+        the per-type stat dicts. Those are computed over every differing
+        row, so an identical column can appear with a zero delta; only a
+        non-zero statistic counts. Differences the stats can't show (e.g.
+        NULL vs a value) are caught by ``verdict`` as unattributed.
         """
         stats_with_tol = {**self.numeric_column_stats, **self.geography_column_stats}
-        cols_with_stats = {
-            *self.numeric_column_stats,
-            *self.string_column_mismatches,
-            *self.geography_column_stats,
-            *self.array_column_stats,
-            *self.kll_column_stats,
+        legacy_stats = {
+            **{c: s.get("max_abs_delta") for c, s in self.numeric_column_stats.items()},
+            **{c: s.get("max_distance_meters") for c, s in self.geography_column_stats.items()},
+            **{c: s.get("mismatch_count") for c, s in self.array_column_stats.items()},
+            **{c: s.get("mismatch_count") for c, s in self.kll_column_stats.items()},
+            **self.string_column_mismatches,
         }
 
         def differs(col: str) -> bool:
@@ -940,7 +946,7 @@ class ComparisonSummary:
                 return (stats["outside_tolerance_count"] or 0) > 0
             if self.column_diff_counts:
                 return self.column_diff_counts.get(col, 0) > 0
-            return col in cols_with_stats
+            return (legacy_stats.get(col) or 0) > 0
 
         return sorted(filter(differs, self.column_types))
 
@@ -951,16 +957,66 @@ class ComparisonSummary:
         return [c for c in self.differing_columns if c not in expected]
 
     @property
-    def verdict(self) -> str:
-        """PASS or FAIL: the comparison's parsable outcome.
+    def unaccounted_schema_drift(self) -> list[str]:
+        """Drifted columns (one side only, or retyped) not ignored or expected."""
+        accounted = {*self.expected_diff_columns, *self.ignored_columns}
+        return [name for name, _ in self.schema_drift if name not in accounted]
 
-        FAIL when a row exists on one side only, or when rows differ in a
-        column that was not expected to differ. Rows differing only in
-        --expect-diff columns pass.
+    @property
+    def fail_reasons(self) -> list[str]:
+        """Why the verdict is FAIL; empty means PASS.
+
+        - rows on one side only;
+        - different row totals, or different duplicate structure (e.g. an
+          extra copy of a duplicated key whose values all match);
+        - rows differing in a column not expected to differ, or rows that
+          differ without any column showing it (never assumed expected);
+        - schema drift not covered by --ignore-columns / --expect-diff.
         """
-        rows_missing = self.rows_only_in_a > 0 or self.rows_only_in_b > 0
-        values_differ = self.rows_in_both_with_differences > 0 and bool(self.failing_columns)
-        return "FAIL" if rows_missing or values_differ else "PASS"
+        dup_rows = [
+            info.duplicate_row_count if info else 0
+            for info in (self.duplicate_info_a, self.duplicate_info_b)
+        ]
+        unattributed = self.rows_in_both_with_differences > 0 and not self.differing_columns
+        aborted = " (pipeline aborted: pre-tolerance counts)" if self.pipeline_aborted else ""
+        return [
+            *([f"{self.rows_only_in_a:,} rows only in A"] if self.rows_only_in_a else []),
+            *([f"{self.rows_only_in_b:,} rows only in B"] if self.rows_only_in_b else []),
+            *(
+                [f"row totals differ ({self.total_rows_a:,} vs {self.total_rows_b:,})"]
+                if self.total_rows_a != self.total_rows_b
+                and not (self.rows_only_in_a or self.rows_only_in_b)
+                else []
+            ),
+            *(
+                [f"duplicate rows differ ({dup_rows[0]:,} vs {dup_rows[1]:,})"]
+                if dup_rows[0] != dup_rows[1]
+                else []
+            ),
+            *(
+                [f"unexpected differences in: {', '.join(self.failing_columns)}{aborted}"]
+                if self.rows_in_both_with_differences and self.failing_columns
+                else []
+            ),
+            *(
+                [
+                    f"{self.rows_in_both_with_differences:,} rows differ in no "
+                    "identifiable column"
+                ]
+                if unattributed
+                else []
+            ),
+            *(
+                [f"schema drift: {', '.join(self.unaccounted_schema_drift)}"]
+                if self.unaccounted_schema_drift
+                else []
+            ),
+        ]
+
+    @property
+    def verdict(self) -> str:
+        """PASS or FAIL: the comparison's parsable outcome (see fail_reasons)."""
+        return "FAIL" if self.fail_reasons else "PASS"
 
     @property
     def total_differences_pretolerance(self) -> int | None:
@@ -1751,7 +1807,7 @@ def generate_dimension_summary(
 
 
 # Derived values written to the JSON for consumers; recomputed on load.
-_DERIVED_JSON_FIELDS = ("verdict", "failing_columns")
+_DERIVED_JSON_FIELDS = ("verdict", "failing_columns", "fail_reasons")
 
 
 def to_json_dict(summary: ComparisonSummary) -> dict:
