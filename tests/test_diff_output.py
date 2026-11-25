@@ -435,7 +435,8 @@ class TestToleranceExclusionIndependentOfFilter:
         # But tolerance exclusion SHOULD still reference score in WHERE.
         # The tolerance generates ABS(a.score - b.score) <= tolerance
         # so "score" must appear somewhere after the SELECT.
-        where_portion = query.split("WHERE")[1] if "WHERE" in query else ""
+        # The main query's WHERE is the last one (the paired-source CTEs come first)
+        where_portion = query.rsplit("WHERE", 1)[1] if "WHERE" in query else ""
         assert "score" in where_portion
         assert "1e-09" in where_portion.lower() or "1e-9" in where_portion.lower()
 
@@ -458,7 +459,8 @@ class TestToleranceExclusionIndependentOfFilter:
         # Without tolerance, score should not appear anywhere
         assert "a__score" not in query
         # The WHERE base condition should only reference val (and key IS NULL checks)
-        where_portion = query.split("WHERE")[1] if "WHERE" in query else ""
+        # The main query's WHERE is the last one (the paired-source CTEs come first)
+        where_portion = query.rsplit("WHERE", 1)[1] if "WHERE" in query else ""
         assert "score" not in where_portion
 
     def test_tolerance_with_geography_outside_filter(self) -> None:
@@ -484,7 +486,8 @@ class TestToleranceExclusionIndependentOfFilter:
         assert "distance_meters" not in query
 
         # But tolerance exclusion SHOULD still reference loc in WHERE
-        where_portion = query.split("WHERE")[1] if "WHERE" in query else ""
+        # The main query's WHERE is the last one (the paired-source CTEs come first)
+        where_portion = query.rsplit("WHERE", 1)[1] if "WHERE" in query else ""
         assert "loc" in where_portion
         assert "ST_DISTANCE" in where_portion
 

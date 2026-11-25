@@ -14,9 +14,9 @@ SET total_rows_b = COUNT(*) FROM table_b
 CREATE TEMP TABLE _l1 AS
   SELECT keys, in_a, in_b, col1__eq, col2__eq, ...,
          a_row, b_row   -- STRUCT of each side's values, matched pairs only
-  FROM (SELECT ..., TO_JSON_STRING(STRUCT(keys)) AS __key FROM table_a) a
-  FULL OUTER JOIN (... table_b) b
-    ON a.__key = b.__key  -- NULL-safe; in_a = a.__key IS NOT NULL
+  FROM a_src a          -- table_a + __key (TO_JSON_STRING(STRUCT(keys))) + __pair
+  FULL OUTER JOIN b_src b
+    ON a.__key = b.__key AND a.__pair = b.__pair  -- NULL-safe; in_a = a.__key IS NOT NULL
   WHERE any column differs OR row only in one table
 
 SET rows_in_both_diff = COUNT(*) FROM _l1 WHERE in_a AND in_b
@@ -43,6 +43,13 @@ Key design points:
 
 - **Single BQ job**: The entire pipeline runs as one `client.query(script)` call
 - **NULL-safe key matching**: every command joins on `__key`, the key columns serialised with `TO_JSON_STRING(STRUCT(...))`, so a NULL in a key column matches NULL on the other side. A plain `a.k = b.k` never matches NULLs, and BigQuery rejects `IS NOT DISTINCT FROM` as a FULL OUTER JOIN condition. `__key` is never NULL for an existing row, so `__key IS NOT NULL` is also the presence flag (`in_a` / `in_b`). A key column itself can't serve as that flag, because it may be NULL in real rows. The duplicate-key check needs no change: `GROUP BY` already groups NULLs together.
+- **One-to-one pairing within duplicated keys** (`QueryBuilder._paired_sources_ctes`, used by the pipeline and the diff query alike). A key join alone pairs every row of a duplicated key with every row of it on the other side: `{X, Y}` against `{X, Y}` gives four pairs, and the two crossed ones read as value differences. So each source gets a `__pair` column:
+  - **Unique keys:** `''`, so they join exactly as on the key alone.
+  - **Keys duplicated on either side:**
+    1. Each row is serialised (as in keyless mode) and its copies are numbered. Copy n of a row pairs with copy n of the identical row on the other side.
+    2. The leftovers of the key are paired in row order, which keeps column-level deltas for them.
+    3. Surplus rows stay unpaired, so they count as only in A or only in B.
+  - **Cost:** `generate_summary` switches pairing off when the duplicate check finds no duplicates. When it's on, it adds no billed bytes: the CTEs re-read columns the query already reads. It does add compute over the duplicated keys' rows.
 - **Temp tables**: `_l1` and `_l2` are `CREATE TEMP TABLE` -- automatically scoped to the script, no cleanup needed
 - **Layer 2 reads only `_l1`**: Layer 1 carries both sides' values for each differing matched pair, so Layer 2 computes deltas without touching the source tables again. Re-joining the sources on the key would pair every row of a duplicated key with every other one (up to n² rows), inflating post-tolerance counts and mispairing deltas. It would also re-scan both tables.
 - **Circuit breaker**: Controlled by `--max-diff-pct` (default: 10%). If too many rows differ, returns Layer 1 counts only with `pipeline_status = 'ABORTED'`

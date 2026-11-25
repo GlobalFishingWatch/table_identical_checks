@@ -84,7 +84,7 @@ Every summary ends with `VERDICT: PASS` or `VERDICT: FAIL (...)`. The JSON outpu
 
 The verdict is **FAIL** when any of these holds:
 - a row exists on one side only;
-- the row totals or the duplicate structure differ, for example an extra copy of a duplicated key whose values all match;
+- the row totals or the duplicate structure differ, for example an extra copy of a duplicated key whose values all match. Rows of duplicated keys are paired one-to-one, identical rows first, so equal duplicate groups don't fail;
 - rows differ in a column not listed in `--expect-diff` (differences within tolerance don't count);
 - rows differ but no column shows the difference. That's never assumed to be expected;
 - **schema drift**: a column exists in one table only, or has a different type, and isn't matched by `--ignore-columns` or `--expect-diff`. Patterns match the union of both schemas, so a column added in B can be ignored.

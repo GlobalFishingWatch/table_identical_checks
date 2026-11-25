@@ -202,9 +202,9 @@ def test_pipeline_script_supports_snapshot_on_only_one_side():
     b = _builder(snapshot_a="2026-05-08 12:00:00 UTC")
     script = b.build_pipeline_script()
     assert "FOR SYSTEM_TIME AS OF TIMESTAMP('2026-05-08 12:00:00 UTC')" in script
-    # B should still appear (its keyed join subquery, alias b) without FOR
-    # SYSTEM_TIME attached. The only FOR SYSTEM_TIME usage should reference tab_a.
-    assert "FROM `proj.ds.tab_b`) AS b" in script
+    # B should still appear (its keyed source subquery in the sb CTE) without
+    # FOR SYSTEM_TIME attached. The only FOR SYSTEM_TIME usage should reference tab_a.
+    assert "FROM `proj.ds.tab_b`) AS t" in script
     for_system_time_lines = [ln for ln in script.split("\n") if "FOR SYSTEM_TIME" in ln]
     assert all("tab_a" in ln for ln in for_system_time_lines)
     assert not any("tab_b" in ln for ln in for_system_time_lines)
