@@ -641,11 +641,14 @@ class TestPipelineGeography:
 
 
 class TestPipelineDuplicateKeys:
-    """Layer 2 must use the pairs Layer 1 compared, not re-pair on the key.
+    """Duplicated keys: rows pair one-to-one, and Layer 2 uses those pairs.
 
     Re-joining _l1 to the sources on the key alone produced up to n^2 rows
     per duplicated key: post-tolerance counts exceeded pre-tolerance ones,
     rows_identical went negative and deltas were computed on mispaired rows.
+    Layer 1 itself now pairs a duplicated key's rows one-to-one (identical
+    rows first, then leftovers in row order; see _paired_sources_ctes), so a
+    surplus row is only in one side rather than crossed with every other row.
     """
 
     def test_layer2_does_not_rejoin_sources(self):
@@ -684,7 +687,7 @@ class TestPipelineDuplicateKeys:
         )
 
     def test_post_tolerance_not_inflated(self, bq_client, table_factory):
-        """Both pairs of the duplicated key differ (the original bug report)."""
+        """A {1.0, 2.0} vs B {3.0}: one leftover pair (1.0, 3.0), 2.0 only in A."""
         builder = self._builder(
             bq_client,
             table_factory,
@@ -702,16 +705,22 @@ class TestPipelineDuplicateKeys:
             bq_client, builder, pipeline_config=PipelineConfig(max_diff_pct=1.0)
         )
 
-        assert summary.rows_in_both_with_differences_pretolerance == 2
-        assert summary.rows_in_both_with_differences == 2
+        assert summary.rows_in_both_with_differences_pretolerance == 1
+        assert summary.rows_in_both_with_differences == 1
+        assert summary.rows_only_in_a == 1
         assert summary.rows_identical == 1
         stats = summary.numeric_column_stats["float_val"]
         assert stats["within_tolerance_count"] == 0
-        assert stats["outside_tolerance_count"] == 2
-        assert summary.column_diff_counts["float_val"] == 2
+        assert stats["outside_tolerance_count"] == 1
+        assert summary.column_diff_counts["float_val"] == 1
+        assert stats["max_abs_delta"] == 2.0  # 1.0 vs 3.0, leftovers in row order
 
     def test_deltas_use_compared_pair(self, bq_client, table_factory):
-        """Only one row of key 1 differs; its identical twin must not be paired in."""
+        """The identical row pairs with its twin; the other is only in A.
+
+        With crossed pairs, this used to report a differing pair and, before
+        that, averaged in the twin's zero delta.
+        """
         builder = self._builder(
             bq_client,
             table_factory,
@@ -723,18 +732,16 @@ class TestPipelineDuplicateKeys:
         )
         result = run_pipeline(bq_client, builder, PipelineConfig(max_diff_pct=1.0))
 
-        assert result.rows_in_both_with_differences == 1
-        assert result.total_differing_rows == 1
-        assert result.post_tolerance_diff_count == 1
-        # The re-join averaged in the twin's zero delta (5 instead of 10)
-        assert result.numeric_column_stats["int_val"]["avg_abs_delta"] == 10
-        assert result.numeric_column_stats["float_val"]["within_tolerance_count"] == 0
+        assert result.rows_in_both_with_differences == 0
+        assert result.rows_only_in_a == 1
+        assert result.total_differing_rows == 0
+        assert result.numeric_column_stats == {}
 
     def test_duplicates_on_both_sides(self, bq_client, table_factory):
-        """2x2 rows for key 1: one equal pair, three differing pairs.
+        """2x2 rows for key 1: 1.0 pairs with 1.0, the leftovers 2.0 and 3.0 pair.
 
-        Keys 2 and 3 are identical padding: 3 differing pairs would exceed
-        the 2 rows per table and trip the circuit breaker even at 100%.
+        Keys 2 and 3 are identical padding. (With crossed pairs this key gave
+        three differing pairs, enough to trip the circuit breaker at 100%.)
         """
         padding = [
             {"id": 2, "int_val": 10, "float_val": 5.0},
@@ -756,9 +763,10 @@ class TestPipelineDuplicateKeys:
         )
         result = run_pipeline(bq_client, builder, PipelineConfig(max_diff_pct=1.0))
 
-        assert result.rows_in_both_with_differences == 3
-        assert result.total_differing_rows == 3
-        assert result.post_tolerance_diff_count == 3
+        assert result.rows_in_both_with_differences == 1
+        assert result.total_differing_rows == 1
+        assert result.post_tolerance_diff_count == 1
+        assert (result.rows_only_in_a, result.rows_only_in_b) == (0, 0)
         stats = result.numeric_column_stats["float_val"]
-        assert stats["within_tolerance_count"] + stats["outside_tolerance_count"] == 3
-        assert stats["max_abs_delta"] == 2.0
+        assert stats["within_tolerance_count"] + stats["outside_tolerance_count"] == 1
+        assert stats["max_abs_delta"] == 1.0

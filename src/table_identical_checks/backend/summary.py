@@ -1253,6 +1253,9 @@ def generate_summary(
 
     # Run duplicate check first (cheap, no join)
     dup_a, dup_b = check_duplicates(client, builder)
+    # Pairing the rows of duplicated keys costs a serialisation and a window
+    # over those rows; skip it when there are none.
+    builder.pair_duplicates = dup_a.has_duplicates or dup_b.has_duplicates
 
     if pipeline_config is not None:
         result = _generate_summary_pipeline(

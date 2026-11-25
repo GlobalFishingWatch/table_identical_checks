@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from sqlalchemy import and_, column, func, literal_column, or_, select, text
+from sqlalchemy import and_, column, func, literal_column, or_, select, table, text
 from sqlalchemy.sql import Selectable
 from sqlalchemy_bigquery import BigQueryDialect
 
@@ -11,6 +11,10 @@ from .tolerance import ToleranceConfig
 
 # Column each side's source carries with its NULL-safe join key (see _key_sql).
 KEY_COL = "__key"
+
+# Column that pairs the rows of a duplicated key one-to-one across the two
+# sides (see _paired_sources_ctes); '' for every row of a unique key.
+PAIR_COL = "__pair"
 
 
 @dataclass
@@ -59,6 +63,10 @@ class QueryBuilder:
     # ceiling on two independent K=200 sketches over smooth distributions.
     kll_abs_tol: float = 0.0
     kll_rel_tol: float = 0.05
+    # Pair the rows of duplicated keys one-to-one (see _paired_sources_ctes).
+    # generate_summary switches it off when the duplicate check found none,
+    # which skips the extra work entirely.
+    pair_duplicates: bool = True
 
     # Columns to exclude from comparison (only keys by default)
     _exclude_from_comparison: set[str] = field(default_factory=set)
@@ -670,10 +678,20 @@ class QueryBuilder:
         Returns:
             SQL query string that will return all differing rows with their deltas.
         """
-        table_a_obj, table_b_obj = self._create_table_objects()
+        # Both sides read the paired-source CTEs (prepended below), so rows of
+        # duplicated keys join one-to-one (see _paired_sources_ctes).
+        def cte_side(name: str, alias: str) -> Selectable:
+            cols = [column(c.name) for c in self._supported_columns()]
+            return table(name, *cols, column(KEY_COL), column(PAIR_COL)).alias(alias)
 
-        # NULL-safe join on the serialised key (see _key_sql)
-        join_condition = table_a_obj.c[KEY_COL] == table_b_obj.c[KEY_COL]
+        table_a_obj = cte_side("a_src", self.alias_a)
+        table_b_obj = cte_side("b_src", self.alias_b)
+
+        # NULL-safe on the key, one-to-one within duplicated keys
+        join_condition = and_(
+            table_a_obj.c[KEY_COL] == table_b_obj.c[KEY_COL],
+            table_a_obj.c[PAIR_COL] == table_b_obj.c[PAIR_COL],
+        )
 
         # Build FULL OUTER JOIN
         full_join = table_a_obj.outerjoin(table_b_obj, onclause=join_condition, full=True)
@@ -693,7 +711,10 @@ class QueryBuilder:
         stmt = select(*select_cols).select_from(full_join).where(where_clause)
 
         # Compile to SQL string for BigQuery dialect
-        return str(stmt.compile(dialect=BigQueryDialect(), compile_kwargs={"literal_binds": True}))
+        compiled = str(
+            stmt.compile(dialect=BigQueryDialect(), compile_kwargs={"literal_binds": True})
+        )
+        return f"WITH {self._paired_sources_ctes()}\n{compiled}"
 
     def build_diff_table_statement(
         self,
@@ -1254,8 +1275,95 @@ class QueryBuilder:
         return name.replace(".", "__")
 
     def _join_keys(self) -> str:
-        """Build the ON clause for the FULL OUTER JOIN (NULL-safe, see _key_sql)."""
-        return f"a.{KEY_COL} = b.{KEY_COL}"
+        """Build the ON clause for the FULL OUTER JOIN of a_src and b_src.
+
+        NULL-safe on the key (see _key_sql) and one-to-one within duplicated
+        keys (see _paired_sources_ctes).
+        """
+        return f"a.{KEY_COL} = b.{KEY_COL} AND a.{PAIR_COL} = b.{PAIR_COL}"
+
+    def _paired_sources_ctes(self) -> str:
+        """CTE definitions ending in ``a_src`` and ``b_src`` (no leading WITH).
+
+        Each is one side's keyed source (see _table_source) plus ``__pair``,
+        so that joining on ``(__key, __pair)`` pairs rows one-to-one. A plain
+        key join would pair every row of a duplicated key with every row of
+        it on the other side: {X, Y} against {X, Y} gives four pairs, and the
+        two crossed ones read as value differences.
+
+        Rows of unique keys get ``__pair = ''`` and join exactly as on the key
+        alone. Rows of keys duplicated on either side are paired in two steps:
+
+        1. identical rows first: each copy of a row (serialised as in keyless
+           mode, see _keyless_row_sql) is numbered within its key, and copy n
+           of a row pairs with copy n of the same row on the other side;
+        2. the leftovers of a key are then paired in row order, so the
+           comparison still reports column-level differences for them.
+
+        Surplus rows on one side end up unpaired, i.e. only in that side.
+        """
+        sa = f"SELECT * FROM {self._table_source(self.table_a, 't', self.partition_filter_a, with_key=True)}"
+        sb = f"SELECT * FROM {self._table_source(self.table_b, 't', self.partition_filter_b, with_key=True)}"
+        if not self.pair_duplicates:
+            return (
+                f"sa AS ({sa}),\n"
+                f"sb AS ({sb}),\n"
+                f"a_src AS (SELECT *, '' AS {PAIR_COL} FROM sa),\n"
+                f"b_src AS (SELECT *, '' AS {PAIR_COL} FROM sb)"
+            )
+
+        row = self._keyless_row_sql()
+        k = KEY_COL
+
+        def occurrences(src: str) -> str:
+            # Rows of duplicated keys, serialised, with copies numbered.
+            return (
+                f"SELECT *, ROW_NUMBER() OVER (PARTITION BY {k}, __row) AS __occ\n"
+                f"  FROM (SELECT t.*, {row} AS __row FROM {src} AS t\n"
+                f"        WHERE t.{k} IN (SELECT {k} FROM dupkeys))"
+            )
+
+        def paired(occ: str) -> str:
+            return (
+                f"SELECT o.* EXCEPT (__row, __occ),\n"
+                f"    IF(m.{k} IS NOT NULL,\n"
+                f"       CONCAT('=', CAST(o.__occ AS STRING), ':', o.__row),\n"
+                f"       CONCAT('~', CAST(ROW_NUMBER() OVER (\n"
+                f"         PARTITION BY o.{k}, m.{k} IS NULL ORDER BY o.__row, o.__occ\n"
+                f"       ) AS STRING))) AS {PAIR_COL}\n"
+                f"  FROM {occ} AS o\n"
+                f"  LEFT JOIN m\n"
+                f"    ON o.{k} = m.{k} AND o.__row = m.__row AND o.__occ = m.__occ"
+            )
+
+        def source(plain: str, pairs: str) -> str:
+            return (
+                f"SELECT *, '' AS {PAIR_COL} FROM {plain}\n"
+                f"  WHERE {k} NOT IN (SELECT {k} FROM dupkeys)\n"
+                f"  UNION ALL\n"
+                f"  SELECT * FROM {pairs}"
+            )
+
+        return (
+            f"sa AS ({sa}),\n"
+            f"sb AS ({sb}),\n"
+            f"dupkeys AS (\n"
+            f"  SELECT {k} FROM sa GROUP BY {k} HAVING COUNT(*) > 1\n"
+            f"  UNION DISTINCT\n"
+            f"  SELECT {k} FROM sb GROUP BY {k} HAVING COUNT(*) > 1\n"
+            f"),\n"
+            f"oa AS (\n  {occurrences('sa')}\n),\n"
+            f"ob AS (\n  {occurrences('sb')}\n),\n"
+            f"m AS (\n"
+            f"  SELECT {k}, __row, __occ FROM oa\n"
+            f"  INTERSECT DISTINCT\n"
+            f"  SELECT {k}, __row, __occ FROM ob\n"
+            f"),\n"
+            f"pa AS (\n  {paired('oa')}\n),\n"
+            f"pb AS (\n  {paired('ob')}\n),\n"
+            f"a_src AS (\n  {source('sa', 'pa')}\n),\n"
+            f"b_src AS (\n  {source('sb', 'pb')}\n)"
+        )
 
     def _coalesced_keys(self) -> str:
         """Build COALESCE(a.key, b.key) AS key for each key column."""
@@ -1389,19 +1497,13 @@ class QueryBuilder:
 
         l1_where = "\n  OR ".join(l1_where_parts)
 
-        source_a_join = self._table_source(
-            self.table_a, "a", self.partition_filter_a, with_key=True
-        )
-        source_b_join = self._table_source(
-            self.table_b, "b", self.partition_filter_b, with_key=True
-        )
-
         l1_stmt = (
             "CREATE TEMP TABLE _l1 AS\n"
+            f"WITH {self._paired_sources_ctes()}\n"
             "SELECT\n"
             f"{l1_select}\n"
-            f"FROM {source_a_join}\n"
-            f"FULL OUTER JOIN {source_b_join}\n"
+            "FROM a_src AS a\n"
+            "FULL OUTER JOIN b_src AS b\n"
             f"  ON {self._join_keys()}\n"
             f"WHERE\n  {l1_where};\n"
         )

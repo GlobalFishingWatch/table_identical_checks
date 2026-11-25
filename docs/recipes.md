@@ -179,9 +179,20 @@ either side, but it warns prominently when it detects duplicates:
   Table B: 169,932 duplicate key(s), 339,864 rows affected, max 2x per key
 ```
 
-Most metrics in the per-column breakdown become meaningless once duplicates
-exist (the `FULL OUTER JOIN` fans out, so `Diff%` can easily exceed 100%).
-The fix is always to broaden the key until it's unique. Common patterns:
+Rows of a duplicated key are paired one-to-one: identical rows first, then the
+leftovers in row order (see [Architecture](architecture.md)). So two tables
+holding the same rows under a duplicated key compare as identical, and a
+surplus copy shows up as a row only in A or only in B. The column-level
+detail for a duplicated key with real differences is less meaningful, though:
+which leftover pairs with which is decided by row order, not by any identity.
+Two consequences:
+- **Tolerance:** identical-row matching is exact, so copies that differ only by
+  float noise become leftovers and may pair with the wrong row.
+- **Very large duplicate groups:** a key shared by millions of rows (e.g. a
+  mostly-NULL key column) puts them all in one window partition, which can
+  exceed BigQuery's resources.
+A unique key gives the most reliable comparison, so broadening the key until
+the warning disappears is still the best fix. Common patterns:
 
 | Symptom | Likely fix |
 |---|---|
