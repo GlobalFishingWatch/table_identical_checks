@@ -49,7 +49,8 @@ Key design points:
     1. Each row is serialised (as in keyless mode) and its copies are numbered. Copy n of a row pairs with copy n of the identical row on the other side.
     2. The leftovers of the key are paired in row order, which keeps column-level deltas for them.
     3. Surplus rows stay unpaired, so they count as only in A or only in B.
-  - **Cost:** `generate_summary` switches pairing off when the duplicate check finds no duplicates. When it's on, it adds no billed bytes: the CTEs re-read columns the query already reads. It does add compute over the duplicated keys' rows.
+  - **Cost:** `generate_summary` switches pairing off when the duplicate check finds no duplicates. When it's on, it adds no billed bytes: BigQuery bills each table's columns once per query, however often the CTEs refer to them. The 81M-row DIT comparison billed 34.67 GB for the whole script, against 33.37 GB for the join alone. It does add compute over the duplicated keys' rows. `diff`, `count` and `breakdown` run no duplicate check, so for them pairing is always on, which costs compute but no bytes.
+  - **Limits:** identical-row matching is exact, so float-noise copies become leftovers paired in row order. A key with millions of rows (e.g. a mostly-NULL key column) is one window partition and can exceed BigQuery's resources.
 - **Temp tables**: `_l1` and `_l2` are `CREATE TEMP TABLE` -- automatically scoped to the script, no cleanup needed
 - **Layer 2 reads only `_l1`**: Layer 1 carries both sides' values for each differing matched pair, so Layer 2 computes deltas without touching the source tables again. Re-joining the sources on the key would pair every row of a duplicated key with every other one (up to n² rows), inflating post-tolerance counts and mispairing deltas. It would also re-scan both tables.
 - **Circuit breaker**: Controlled by `--max-diff-pct` (default: 10%). If too many rows differ, returns Layer 1 counts only with `pipeline_status = 'ABORTED'`

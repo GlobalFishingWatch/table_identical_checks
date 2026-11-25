@@ -185,6 +185,12 @@ holding the same rows under a duplicated key compare as identical, and a
 surplus copy shows up as a row only in A or only in B. The column-level
 detail for a duplicated key with real differences is less meaningful, though:
 which leftover pairs with which is decided by row order, not by any identity.
+Two consequences:
+- **Tolerance:** identical-row matching is exact, so copies that differ only by
+  float noise become leftovers and may pair with the wrong row.
+- **Very large duplicate groups:** a key shared by millions of rows (e.g. a
+  mostly-NULL key column) puts them all in one window partition, which can
+  exceed BigQuery's resources.
 A unique key gives the most reliable comparison, so broadening the key until
 the warning disappears is still the best fix. Common patterns:
 
